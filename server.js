@@ -16,6 +16,7 @@
      ALLOWED_ORIGIN  دومين التطبيق لـ CORS (أكثر من واحد مفصولة بفاصلة؛ * للتجربة فقط)
      DATA_FILE       مسار قاعدة البيانات JSON (./data/db.json)
      DEV_MODE=1      يسمح بالترويسة x-dev-user-id بدل initData (للتطوير فقط!)
+     ADMIN_DEMO_TOOLS=1  يفعّل أمري الأدمن التجريبيين simInvite و reset (reset يمسح كل البيانات! — للتجربة فقط)
 
    ───────────────────────── قائمة كل المسارات ─────────────────────────
    عام
@@ -40,6 +41,7 @@
      login · stats · users · user · balance · ban · delete
      withdrawals · withdrawal · settings · saveSettings
      tasks · saveTask · deleteTask · promos · savePromo · deletePromo
+     simInvite · reset   (تجريبيان — يعملان فقط مع ADMIN_DEMO_TOOLS=1)
    ════════════════════════════════════════════════════════════════════════ */
 'use strict';
 const express = require('express');
@@ -56,6 +58,7 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || crypto.randomBytes(32).toString
 const ALLOWED = (process.env.ALLOWED_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean);
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'db.json');
 const DEV_MODE = process.env.DEV_MODE === '1';
+const DEMO_TOOLS = process.env.ADMIN_DEMO_TOOLS === '1';
 const INIT_MAX_AGE = 24 * 3600; // ثانية — عمر initData المسموح
 const DAY = 86400000;
 
@@ -508,6 +511,24 @@ const ADMIN = {
     save(); return { promos: DB.promos };
   },
   deletePromo: (b) => { DB.promos = DB.promos.filter((x) => x.code !== b.code); save(); return { promos: DB.promos }; },
+  // محاكاة دعوة صديق لرؤية أثر «مكافأة الإحالة» (تجريبي — معطّل افتراضيًا)
+  simInvite: (b) => {
+    if (!DEMO_TOOLS) fail('not_found', 404);
+    const x = AU(b.id), rw = RAW().referralReward;
+    let id; do { id = Math.floor(5200000000 + Math.random() * 99999999); } while (getUser(id));
+    DB.users[String(id)] = mkUser(id, {
+      first_name: 'صديق', last_name: `#${String(id).slice(-3)}`, invitedBy: x.id, refBonus: rw, balance: 0.5, totalEarned: 0.5,
+      history: [{ type: 'welcome', amount: 0.5, at: Date.now() }],
+    });
+    x.referralEarnings = r2(x.referralEarnings + rw); addTx(x, 'referral', rw, { ref: 'صديق تجريبي' }); save();
+    return { ok: true };
+  },
+  // إعادة ضبط كل البيانات (تجريبي — معطّل افتراضيًا لأنه يمسح قاعدة البيانات بالكامل)
+  reset: () => {
+    if (!DEMO_TOOLS) fail('not_found', 404);
+    DB = { users: {}, tasks: SEED_TASKS.map((t) => ({ ...t })), promos: [], settings: {} };
+    flush(); return { ok: true };
+  },
 };
 
 app.post('/api/admin/:action', limiter('admin', 60, 60000), (req, res, next) => {
@@ -534,4 +555,3 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
 });
 
 app.listen(PORT, () => console.log(`✅ الخادم يعمل على المنفذ ${PORT}`));
-
