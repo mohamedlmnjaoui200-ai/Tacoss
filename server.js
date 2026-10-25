@@ -327,7 +327,9 @@ app.use(async (req, res, next) => { // انتظار الاتصال بقاعدة 
       : n === 'MongoParseError' || /Invalid (scheme|connection string)|must begin with|URI/i.test(m) ? 'invalid_uri_format'
       : n === 'MongoServerSelectionError' ? 'cannot_reach_atlas_check_network_access_0.0.0.0/0'
       : /Cannot find module/i.test(m) ? 'mongodb_package_missing' : n || 'unknown';
-    res.status(503).json({ success: false, code: 'db_unavailable', message: 'قاعدة البيانات غير متاحة', hint });
+    res.status(503).json({ success: false, code: 'db_unavailable', message: 'قاعدة البيانات غير متاحة', hint,
+      // تشخيص مؤقت (لا يكشف كلمة المرور) — احذفه بعد حل المشكلة
+      dbg: { user: (MONGODB_URI.match(/\/\/([^:]+):/) || [])[1], pwLen: ((MONGODB_URI.match(/\/\/[^:]+:(.*)@/) || [])[1] || '').length, host: (MONGODB_URI.match(/@([^/?]+)/) || [])[1], db: MONGODB_DB, err: String(e.message).slice(0, 120) } });
   }
 });
 
