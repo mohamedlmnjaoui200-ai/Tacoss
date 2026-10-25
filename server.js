@@ -7,6 +7,10 @@
      npm i express mongodb
      ضع الإعدادات في ملف .env بجانب هذا الملف (أو كمتغيرات بيئة في الاستضافة) ثم:  node server.js
 
+   المطلوب فقط (4 متغيرات): MONGODB_URI · BOT_TOKEN · ADMIN_USER · ADMIN_PASS
+   الباقي اختياري: ADMIN_SECRET و WEBHOOK_SECRET يُشتقّان من BOT_TOKEN، و PUBLIC_URL يؤخذ من Vercel تلقائيًا،
+   و ALLOWED_ORIGIN الافتراضي * (يُفضّل ضبطه على دومين الواجهة).
+
    متغيرات البيئة:
      MONGODB_URI     رابط الاتصال بـ MongoDB (مطلوب)
      MONGODB_DB      اسم قاعدة البيانات (moneyslayer)
@@ -70,12 +74,14 @@ const MONGODB_DB = process.env.MONGODB_DB || 'moneyslayer';
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASS = process.env.ADMIN_PASS || '';
-const ADMIN_SECRET = process.env.ADMIN_SECRET || crypto.randomBytes(32).toString('hex');
-const ALLOWED = (process.env.ALLOWED_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean);
+// أسرار تُشتق تلقائيًا من BOT_TOKEN إذا لم تُضبط — فتكفي 4 متغيرات فقط (MONGODB_URI, BOT_TOKEN, ADMIN_USER, ADMIN_PASS)
+const derive = (label) => (BOT_TOKEN ? crypto.createHmac('sha256', BOT_TOKEN).update(label).digest('hex') : '');
+const ADMIN_SECRET = process.env.ADMIN_SECRET || derive('admin') || crypto.randomBytes(32).toString('hex');
+const ALLOWED = (process.env.ALLOWED_ORIGIN || '*').split(',').map((s) => s.trim()).filter(Boolean);
 const DEV_MODE = process.env.DEV_MODE === '1';
 const DEMO_TOOLS = process.env.ADMIN_DEMO_TOOLS === '1';
-const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/+$/, '');
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+const PUBLIC_URL = (process.env.PUBLIC_URL || (process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : '')).replace(/\/+$/, '');
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || derive('webhook').slice(0, 48);
 const APP_URL = process.env.APP_URL || '';
 const PENDING_TTL = 7 * 24 * 3600 * 1000; // مهلة صلاحية إحالة «Start» قبل فتح التطبيق
 const INIT_MAX_AGE = 24 * 3600; // ثانية — عمر initData المسموح
@@ -85,7 +91,7 @@ if (!MONGODB_URI) console.error('❌ MONGODB_URI غير مضبوط: لن يعم�
 if (!DEV_MODE && !BOT_TOKEN) console.warn('⚠️  BOT_TOKEN غير مضبوط: كل طلبات المستخدمين ستُرفض.');
 if (!WEBHOOK_SECRET) console.warn('⚠️  WEBHOOK_SECRET غير مضبوط: لن تُحتسب الإحالة القادمة من رابط البوت (?start=) — رابط التطبيق المباشر (startapp) يعمل.');
 if (!ADMIN_USER || !ADMIN_PASS) console.warn('⚠️  ADMIN_USER/ADMIN_PASS غير مضبوطين: دخول الأدمن معطّل.');
-if (!process.env.ADMIN_SECRET) console.warn('⚠️  ADMIN_SECRET غير مضبوط: تنتهي جلسات الأدمن عند كل إعادة تشغيل.');
+if (!process.env.ADMIN_SECRET && !BOT_TOKEN) console.warn('⚠️  ADMIN_SECRET غير مضبوط: تنتهي جلسات الأدمن عند كل إعادة تشغيل.');
 
 /* ───────────── الإعدادات الافتراضية (نفس src/data.js) ───────────── */
 const DEFAULT_CONFIG = {
@@ -311,7 +317,18 @@ app.use(express.json({ limit: '100kb' }));
 
 app.use(async (req, res, next) => { // انتظار الاتصال بقاعدة البيانات
   try { await dbReady(); next(); }
-  catch (e) { console.error('mongo:', e.message); res.status(503).json({ success: false, code: 'db_unavailable', message: 'قاعدة البيانات غير متاحة' }); }
+  catch (e) {
+    console.error('mongo:', e.name, e.code || '', e.message);
+    // تلميح آمن لسبب الفشل (بدون أي أسرار) لتسهيل التشخيص
+    const m = String(e.message || ''), n = String(e.name || '');
+    const hint = !MONGODB_URI ? 'MONGODB_URI_missing'
+      : /bad auth|Authentication failed|AuthenticationFailed/i.test(m) ? 'wrong_username_or_password'
+      : /ENOTFOUND|querySrv|ECONNREFUSED.*53/i.test(m) ? 'wrong_cluster_host_or_dns'
+      : n === 'MongoParseError' || /Invalid (scheme|connection string)|must begin with|URI/i.test(m) ? 'invalid_uri_format'
+      : n === 'MongoServerSelectionError' ? 'cannot_reach_atlas_check_network_access_0.0.0.0/0'
+      : /Cannot find module/i.test(m) ? 'mongodb_package_missing' : n || 'unknown';
+    res.status(503).json({ success: false, code: 'db_unavailable', message: 'قاعدة البيانات غير متاحة', hint });
+  }
 });
 
 // حدّ معدّل بسيط في الذاكرة (لكل مفتاح: عدد الطلبات في نافذة زمنية)
