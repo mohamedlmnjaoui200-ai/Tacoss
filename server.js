@@ -16,12 +16,16 @@
      ALLOWED_ORIGIN  دومين التطبيق لـ CORS (أكثر من واحد مفصولة بفاصلة؛ * للتجربة فقط)
      DATA_FILE       مسار قاعدة البيانات JSON (./data/db.json)
      DEV_MODE=1      يسمح بالترويسة x-dev-user-id بدل initData (للتطوير فقط!)
+     PUBLIC_URL      الرابط العام للخادم https://api.example.com — لتسجيل webhook البوت تلقائيًا
+     WEBHOOK_SECRET  سر webhook (حروف/أرقام/_/- فقط) — مطلوب لاحتساب الإحالة عند ضغط Start في البوت
+     APP_URL         رابط التطبيق المصغّر https://your-app.vercel.app — لزر «افتح التطبيق» في رد البوت
      ADMIN_DEMO_TOOLS=1  يفعّل أمري الأدمن التجريبيين simInvite و reset (reset يمسح كل البيانات! — للتجربة فقط)
 
    ───────────────────────── قائمة كل المسارات ─────────────────────────
    عام
      GET  /health
      GET  /api/config
+     POST /telegram/webhook   (من تيليجرام فقط — ترويسة X-Telegram-Bot-Api-Secret-Token) يحتسب إحالة /start ref_<id>
    المستخدم (ترويسة x-telegram-init-data)
      GET  /api/user/profile?start_param=
      GET  /api/tasks
@@ -59,10 +63,15 @@ const ALLOWED = (process.env.ALLOWED_ORIGIN || '').split(',').map((s) => s.trim(
 const DATA_FILE = process.env.DATA_FILE || path.join(__dirname, 'data', 'db.json');
 const DEV_MODE = process.env.DEV_MODE === '1';
 const DEMO_TOOLS = process.env.ADMIN_DEMO_TOOLS === '1';
+const PUBLIC_URL = (process.env.PUBLIC_URL || '').replace(/\/+$/, '');
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+const APP_URL = process.env.APP_URL || '';
+const PENDING_TTL = 7 * 24 * 3600 * 1000; // مهلة صلاحية إحالة «Start» قبل فتح التطبيق
 const INIT_MAX_AGE = 24 * 3600; // ثانية — عمر initData المسموح
 const DAY = 86400000;
 
 if (!DEV_MODE && !BOT_TOKEN) console.warn('⚠️  BOT_TOKEN غير مضبوط: كل طلبات المستخدمين ستُرفض.');
+if (!WEBHOOK_SECRET) console.warn('⚠️  WEBHOOK_SECRET غير مضبوط: لن تُحتسب الإحالة القادمة من رابط البوت (?start=) — رابط التطبيق المباشر (startapp) يعمل.');
 if (!ADMIN_USER || !ADMIN_PASS) console.warn('⚠️  ADMIN_USER/ADMIN_PASS غير مضبوطين: دخول الأدمن معطّل.');
 
 /* ───────────── الإعدادات الافتراضية (نفس src/data.js) ───────────── */
@@ -113,7 +122,7 @@ const fail = (code, status = 400, extra = {}) => { throw new AppError(code, stat
 /* ───────────── قاعدة البيانات (JSON في الذاكرة + حفظ ذرّي على القرص) ─────────────
    Node يعمل بخيط واحد: كل معالج متزامن (بدون await بين القراءة والكتابة) فهو ذرّي فعليًا،
    ولذلك خصم الرصيد والتحقق منه يتمان في نفس الخطوة. للإنتاج الكبير انقل لـ PostgreSQL/Mongo. */
-let DB = { users: {}, tasks: SEED_TASKS.map((t) => ({ ...t })), promos: [], settings: {} };
+let DB = { users: {}, tasks: SEED_TASKS.map((t) => ({ ...t })), promos: [], settings: {}, pendingRefs: {} };
 try {
   if (fs.existsSync(DATA_FILE)) DB = { ...DB, ...JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')) };
 } catch (e) { console.error('تعذّر قراءة قاعدة البيانات:', e.message); process.exit(1); }
@@ -136,7 +145,7 @@ const CFG = () => { const c = RAW(); return { ...c, methods: (c.methods || []).f
 const mkUser = (id, o = {}) => ({
   id, first_name: '', last_name: '', username: '', photo_url: '', balance: 0, totalEarned: 0, referralEarnings: 0, completed: 0, streak: 0,
   lastCheckin: 0, lastSpin: 0, lastAd: 0, adSession: 0, adDays: {}, taskState: {}, taskDays: {}, chestDay: '', milestones: [],
-  joinedAt: Date.now(), history: [], withdrawals: [], invitedBy: 0, refBonus: 0, banned: false, banReason: '', usedPromos: [], lastWithdrawAt: 0, ...o,
+  joinedAt: Date.now(), onboarded: false, history: [], withdrawals: [], invitedBy: 0, refBonus: 0, banned: false, banReason: '', usedPromos: [], lastWithdrawAt: 0, ...o,
 });
 const getUser = (id) => DB.users[String(id)];
 const allUsers = () => Object.values(DB.users);
@@ -165,6 +174,28 @@ const publicTask = (t, u) => {
   return { ...pub, status: st.status || 'available', verifyAt: st.verifyAt || 0 };
 };
 const taskList = (u) => DB.tasks.filter((t) => t.active !== false).map((t) => publicTask(t, u));
+
+/* ───────────── الإحالة: تُحتسب مرة واحدة عند أول دخول للحساب ─────────────
+   المصادر (بالأولوية): start_param من رابط التطبيق المباشر (startapp=ref_ID) ← ثم إحالة معلّقة من webhook البوت (ضغط Start).
+   الاحتساب داخل auth حتى لا يضيع إذا كان أول طلب /tasks وليس /user/profile (الواجهة ترسلهما معًا). */
+const parseRef = (sp) => { const m = /^ref_(\d{3,15})$/.exec(String(sp || '').trim()); return m ? Number(m[1]) : 0; };
+
+function onboard(u, startParam) {
+  if (u.onboarded !== false) return; // حسابات قديمة (بدون الحقل) تُعتبر مكتملة
+  u.onboarded = true;
+  const c = CFG(), key = String(u.id), pend = DB.pendingRefs[key];
+  delete DB.pendingRefs[key];
+  let refId = parseRef(startParam);
+  if (!refId && pend && Date.now() - pend.at < PENDING_TTL) refId = Number(pend.ref) || 0;
+  const inviter = refId && refId !== u.id ? getUser(refId) : null;
+  if (c.welcomeBonus > 0) addTx(u, 'welcome', c.welcomeBonus);
+  if (inviter && !inviter.banned) {
+    u.invitedBy = inviter.id; u.refBonus = c.referralReward;
+    inviter.referralEarnings = r2(inviter.referralEarnings + c.referralReward);
+    addTx(inviter, 'referral', c.referralReward, { ref: u.first_name || 'صديق' });
+  }
+  save();
+}
 
 /* ───────────── التحقق من هوية تيليجرام ───────────── */
 function verifyInitData(raw) {
@@ -197,6 +228,7 @@ function auth(req, res, next) {
     if (tg.user.photo_url) u.photo_url = String(tg.user.photo_url).slice(0, 300);
     req.tg = tg; req.u = u; req.created = created;
     if (u.banned) fail('banned', 403);
+    onboard(u, req.query.start_param || tg.start_param);
     next();
   } catch (e) { next(e); }
 }
@@ -236,26 +268,49 @@ const wrap = (fn) => (req, res, next) => Promise.resolve().then(() => fn(req, re
 app.get('/health', (req, res) => res.json({ ok: true, users: allUsers().length }));
 app.get('/api/config', wrap(() => ({ config: CFG() })));
 
+/* ═══════════════ webhook البوت (احتساب إحالة /start ref_<id>) ═══════════════
+   خارج /api عمدًا حتى لا يخضع لحدّ المعدّل العام (كل الطلبات من خوادم تيليجرام). */
+const tgCall = async (method, body) => {
+  const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  return r.json();
+};
+
+async function sendWelcome(chatId) {
+  const c = CFG(), bot = String(c.botUsername || '').replace(/^@/, '');
+  let button = null;
+  if (APP_URL) button = { text: '🚀 افتح التطبيق', web_app: { url: APP_URL } };
+  else if (c.miniAppName && bot) button = { text: '🚀 افتح التطبيق', url: `https://t.me/${bot}/${c.miniAppName}` };
+  await tgCall('sendMessage', { chat_id: chatId, text: `أهلًا بك في ${c.appName} 👋\nاضغط الزر بالأسفل لفتح التطبيق وابدأ بجمع الأرباح.`, ...(button ? { reply_markup: { inline_keyboard: [[button]] } } : {}) });
+}
+
+async function handleUpdate(up) {
+  const m = up && up.message;
+  if (!m || !m.from || m.from.is_bot || !m.chat || m.chat.type !== 'private') return;
+  const t = /^\/start(?:@\w+)?(?:\s+(\S+))?/.exec(String(m.text || ''));
+  if (!t) return;
+  const uid = Number(m.from.id), ref = parseRef(t[1]), inviter = ref ? getUser(ref) : null;
+  // تُسجَّل الإحالة فقط لمن لم يدخل التطبيق من قبل، وأول إحالة صالحة هي المعتمدة
+  if (inviter && !inviter.banned && ref !== uid && !getUser(uid)) {
+    const cur = DB.pendingRefs[String(uid)];
+    if (!cur || Date.now() - cur.at >= PENDING_TTL) { DB.pendingRefs[String(uid)] = { ref, at: Date.now() }; save(); }
+  }
+  await sendWelcome(m.chat.id);
+}
+
+app.post('/telegram/webhook', (req, res) => {
+  if (!BOT_TOKEN || !WEBHOOK_SECRET || !safeEq(req.headers['x-telegram-bot-api-secret-token'] || '', WEBHOOK_SECRET)) return res.sendStatus(403);
+  res.sendStatus(200); // الرد فورًا حتى لا يعيد تيليجرام الإرسال
+  handleUpdate(req.body).catch((e) => console.error('webhook:', e.message));
+});
+setInterval(() => { const n = Date.now(); for (const [k, v] of Object.entries(DB.pendingRefs || {})) if (n - v.at >= PENDING_TTL) delete DB.pendingRefs[k]; }, 3600000).unref();
+
 /* ═══════════════ المستخدم ═══════════════ */
 const U = express.Router();
 U.use(auth);
 
-// GET /api/user/profile?start_param=  — ينشئ الحساب أول مرة ويحتسب الإحالة
+// GET /api/user/profile?start_param=  — الحساب والإحالة يُنشآن في auth (onboard) عند أول طلب
 U.get('/user/profile', wrap((req) => {
   const u = req.u;
-  if (req.created) {
-    const c = CFG();
-    const sp = String(req.query.start_param || req.tg.start_param || '');
-    const m = /^ref_(\d{3,15})$/.exec(sp);
-    const inviter = m && Number(m[1]) !== u.id ? getUser(m[1]) : null;
-    if (c.welcomeBonus > 0) addTx(u, 'welcome', c.welcomeBonus);
-    if (inviter && !inviter.banned) {
-      u.invitedBy = inviter.id; u.refBonus = c.referralReward;
-      inviter.referralEarnings = r2(inviter.referralEarnings + c.referralReward);
-      addTx(inviter, 'referral', c.referralReward, { ref: u.first_name || 'صديق' });
-    }
-    save();
-  }
   return { user: { id: u.id, first_name: u.first_name, last_name: u.last_name, username: u.username, photo_url: u.photo_url }, profile: profileOf(u) };
 }));
 
@@ -517,7 +572,7 @@ const ADMIN = {
     const x = AU(b.id), rw = RAW().referralReward;
     let id; do { id = Math.floor(5200000000 + Math.random() * 99999999); } while (getUser(id));
     DB.users[String(id)] = mkUser(id, {
-      first_name: 'صديق', last_name: `#${String(id).slice(-3)}`, invitedBy: x.id, refBonus: rw, balance: 0.5, totalEarned: 0.5,
+      first_name: 'صديق', last_name: `#${String(id).slice(-3)}`, onboarded: true, invitedBy: x.id, refBonus: rw, balance: 0.5, totalEarned: 0.5,
       history: [{ type: 'welcome', amount: 0.5, at: Date.now() }],
     });
     x.referralEarnings = r2(x.referralEarnings + rw); addTx(x, 'referral', rw, { ref: 'صديق تجريبي' }); save();
@@ -526,7 +581,7 @@ const ADMIN = {
   // إعادة ضبط كل البيانات (تجريبي — معطّل افتراضيًا لأنه يمسح قاعدة البيانات بالكامل)
   reset: () => {
     if (!DEMO_TOOLS) fail('not_found', 404);
-    DB = { users: {}, tasks: SEED_TASKS.map((t) => ({ ...t })), promos: [], settings: {} };
+    DB = { users: {}, tasks: SEED_TASKS.map((t) => ({ ...t })), promos: [], settings: {}, pendingRefs: {} };
     flush(); return { ok: true };
   },
 };
@@ -554,4 +609,11 @@ app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   res.status(500).json({ success: false, code: 'server_error', message: 'خطأ في الخادم' });
 });
 
-app.listen(PORT, () => console.log(`✅ الخادم يعمل على المنفذ ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`✅ الخادم يعمل على المنفذ ${PORT}`);
+  if (BOT_TOKEN && PUBLIC_URL && WEBHOOK_SECRET) {
+    tgCall('setWebhook', { url: `${PUBLIC_URL}/telegram/webhook`, secret_token: WEBHOOK_SECRET, allowed_updates: ['message'] })
+      .then((j) => console.log(j.ok ? '✅ تم تسجيل webhook البوت' : `⚠️  فشل تسجيل webhook: ${j.description}`))
+      .catch((e) => console.error('setWebhook:', e.message));
+  }
+});
