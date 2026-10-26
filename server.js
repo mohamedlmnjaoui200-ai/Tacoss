@@ -85,7 +85,7 @@ const PUBLIC_URL = (process.env.PUBLIC_URL || (process.env.VERCEL_PROJECT_PRODUC
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || derive('webhook').slice(0, 48);
 const APP_URL = process.env.APP_URL || '';
 // روابط رسالة الترحيب (/start) — يمكن تغييرها من متغيرات البيئة دون تعديل الكود
-const FRONTEND_URL = APP_URL || 'https://glistening-shortbread-e55027.netlify.app'; // رابط التطبيق (زر «اربح الان»)
+const FRONTEND_URL = APP_URL || 'https://jovial-marigold-96501a.netlify.app/'; // رابط التطبيق (زر «اربح الان»)
 const CHANNEL_URL = process.env.CHANNEL_URL || 'https://t.me/moneyslayerchannel';  // رابط القناة
 const GROUP_URL = process.env.GROUP_URL || 'https://t.me/moneyslayergroup';        // رابط المجموعة
 const INIT_MAX_AGE = 24 * 3600; // ثانية — عمر initData المسموح
