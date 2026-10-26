@@ -28,8 +28,9 @@
    ───────────────────────── قائمة كل المسارات ─────────────────────────
    عام
      GET  /health
+     GET  /telegram/setup?key=<WEBHOOK_SECRET>   تسجيل webhook البوت وعرض حالته (للتشخيص)
      GET  /api/config
-     POST /telegram/webhook   (من تيليجرام فقط — ترويسة X-Telegram-Bot-Api-Secret-Token) يحتسب إحالة /start ref_<id>
+     POST /telegram/webhook   (من تيليجرام فقط — ترويسة X-Telegram-Bot-Api-Secret-Token) ضغط /start ref_<id> ينشئ الحساب ويحتسب الإحالة فورًا
    المستخدم (ترويسة x-telegram-init-data)
      GET  /api/user/profile?start_param=
      GET  /api/tasks
@@ -46,7 +47,7 @@
      POST /api/ads/claim
      POST /api/withdraw               {method,amount,address} | {method:'bank',amount,address,bank,holder,country,countryName}
    الإدارة (POST /api/admin/:action — ترويسة x-admin-token ما عدا login)
-     login · stats · users · user · balance · ban · delete
+     login · stats · users · user · balance · ban · delete · webhook
      withdrawals · withdrawal · settings · saveSettings
      tasks · saveTask · deleteTask · promos · savePromo · deletePromo
      simInvite · reset   (تجريبيان — يعملان فقط مع ADMIN_DEMO_TOOLS=1)
@@ -83,7 +84,6 @@ const DEMO_TOOLS = process.env.ADMIN_DEMO_TOOLS === '1';
 const PUBLIC_URL = (process.env.PUBLIC_URL || (process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : '')).replace(/\/+$/, '');
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || derive('webhook').slice(0, 48);
 const APP_URL = process.env.APP_URL || '';
-const PENDING_TTL = 7 * 24 * 3600 * 1000; // مهلة صلاحية إحالة «Start» قبل فتح التطبيق
 const INIT_MAX_AGE = 24 * 3600; // ثانية — عمر initData المسموح
 const DAY = 86400000;
 
@@ -141,10 +141,10 @@ class AppError extends Error {
 const fail = (code, status = 400, extra = {}) => { throw new AppError(code, status, extra); };
 
 /* ───────────── قاعدة البيانات (MongoDB) ─────────────
-   المجموعات: users (_id = معرّف تيليجرام) · tasks · promos (_id = الكود) · settings · pendingRefs · meta
+   المجموعات: users (_id = معرّف تيليجرام) · tasks · promos (_id = الكود) · settings · meta
    كل تعديل على الرصيد يتم بتحديث ذرّي واحد (pipeline update) مع شرط في الفلتر،
    فلا يمكن لطلبين متزامنين خصم نفس الرصيد مرتين أو استلام نفس المكافأة مرتين. */
-let users, tasksC, promos, settingsC, pendingC, metaC;
+let users, tasksC, promos, settingsC, metaC;
 
 async function seedTasks() {
   const first = await metaC.updateOne({ _id: 'seeded' }, { $setOnInsert: { at: Date.now() } }, { upsert: true });
@@ -158,11 +158,10 @@ async function connect() {
   await client.connect();
   const db = client.db(MONGODB_DB);
   users = db.collection('users'); tasksC = db.collection('tasks'); promos = db.collection('promos');
-  settingsC = db.collection('settings'); pendingC = db.collection('pendingRefs'); metaC = db.collection('meta');
+  settingsC = db.collection('settings'); metaC = db.collection('meta');
   await Promise.all([
     users.createIndex({ invitedBy: 1 }), users.createIndex({ totalEarned: -1 }), users.createIndex({ joinedAt: -1 }),
     users.createIndex({ 'withdrawals.id': 1 }), promos.createIndex({ createdAt: -1 }),
-    pendingC.createIndex({ exp: 1 }, { expireAfterSeconds: 0 }),
   ]);
   await seedTasks();
   await ensureWebhook().catch((e) => console.error('setWebhook:', e.message));
@@ -185,7 +184,7 @@ const CFG = async () => { const c = await RAW(); return { ...c, methods: (c.meth
 const mkUser = (id, o = {}) => ({
   id, first_name: '', last_name: '', username: '', photo_url: '', balance: 0, totalEarned: 0, referralEarnings: 0, completed: 0, streak: 0,
   lastCheckin: 0, lastSpin: 0, lastAd: 0, adSession: 0, adDays: {}, adsEarned: 0, taskState: {}, taskDays: {}, chestDay: '', milestones: [],
-  joinedAt: Date.now(), onboarded: false, history: [], withdrawals: [], invitedBy: 0, refBonus: 0, banned: false, banReason: '', usedPromos: [], lastWithdrawAt: 0, ...o,
+  joinedAt: Date.now(), onboarded: true, history: [], withdrawals: [], invitedBy: 0, refBonus: 0, banned: false, banReason: '', usedPromos: [], lastWithdrawAt: 0, ...o,
 });
 const getUser = (id) => users.findOne({ _id: Number(id) });
 const curStreak = (u) => (Date.now() - u.lastCheckin > 2 * DAY ? 0 : u.streak);
@@ -232,22 +231,65 @@ const publicTask = (t, u) => {
   return { ...pub, status: st.status || 'available', verifyAt: st.verifyAt || 0 };
 };
 
-/* ───────────── الإحالة: تُحتسب مرة واحدة عند أول دخول للحساب ─────────────
-   المصادر (بالأولوية): start_param من رابط التطبيق المباشر (startapp=ref_ID) ← ثم إحالة معلّقة من webhook البوت (ضغط Start).
-   الاحتساب داخل auth حتى لا يضيع إذا كان أول طلب /tasks وليس /user/profile (الواجهة ترسلهما معًا). */
-const parseRef = (sp) => { const m = /^ref_(\d{3,15})$/.exec(String(sp || '').trim()); return m ? Number(m[1]) : 0; };
+/* ───────────── التسجيل والإحالة (مشترك بين التطبيق والبوت) ─────────────
+   الحساب يُنشأ مرة واحدة بـ upsert ذرّي (مع مكافأة الترحيب داخل المستند نفسه)، وعند الإنشاء الفعلي فقط
+   (أي أول ظهور للحساب سواء من التطبيق أو من ضغط Start في البوت) تُحتسب الإحالة لصاحب الرابط.
+   لا يوجد وضع وسيط «مُنشأ لكن لم يُحتسب»: إن فشلت الإحالة تُسجَّل في السجل ولا يتعطل الدخول.
+   المصادر: start_param من رابط التطبيق (startapp=ref_ID) أو من رابط البوت (start=ref_ID) — كلاهما بالصيغة نفسها. */
+const parseRef = (sp) => { const m = /^(?:ref_)?(\d{3,15})$/.exec(String(sp || '').trim()); return m ? Number(m[1]) : 0; };
 
-async function onboard(u, startParam) {
-  const c = await CFG();
-  const pend = await pendingC.findOneAndDelete({ _id: u.id });
-  let refId = parseRef(startParam);
-  if (!refId && pend && pend.exp > new Date()) refId = Number(pend.ref) || 0;
-  const inviter = refId && refId !== u.id ? await getUser(refId) : null;
-  if (c.welcomeBonus > 0) await credit({ _id: u.id }, 'welcome', c.welcomeBonus);
-  if (inviter && !inviter.banned) {
-    await users.updateOne({ _id: u.id }, { $set: { invitedBy: inviter.id, refBonus: c.referralReward } });
-    await credit({ _id: inviter.id }, 'referral', c.referralReward, { ref: u.first_name || 'صديق' }, { expr: { referralEarnings: rnd('$referralEarnings', r2(c.referralReward)) } });
+/** يربط الحساب الجديد بالمُحيل ويمنحه المكافأة. يعيد المُحيل أو null (مع سبب في السجل) */
+async function applyReferral(u, refId, c) {
+  if (!refId) return null;
+  if (refId === u.id) { console.log(`[ref] skip self ${u.id}`); return null; }
+  const inviter = await getUser(refId);
+  if (!inviter) { console.log(`[ref] skip: inviter ${refId} not found (referred ${u.id})`); return null; }
+  if (inviter.banned) { console.log(`[ref] skip: inviter ${refId} banned`); return null; }
+  const rw = r2(c.referralReward);
+  // ربط ذرّي: ينجح مرة واحدة فقط لهذا الحساب
+  const claim = await users.updateOne({ _id: u.id, invitedBy: 0 }, { $set: { invitedBy: inviter.id, refBonus: rw } });
+  if (!claim.modifiedCount) return null;
+  try {
+    if (rw > 0) await credit({ _id: inviter.id }, 'referral', rw, { ref: u.first_name || 'صديق' }, { expr: { referralEarnings: rnd('$referralEarnings', rw) } });
+  } catch (e) { // تراجع عن الربط كي لا يُحسب صديق بلا مكافأة
+    await users.updateOne({ _id: u.id }, { $set: { invitedBy: 0, refBonus: 0 } }).catch(() => {});
+    throw e;
   }
+  console.log(`[ref] ok: ${u.id} invited by ${inviter.id} (+${rw})`);
+  return inviter;
+}
+
+/** ينشئ الحساب إن لم يكن موجودًا (ويحتسب الإحالة عندها فقط)، أو يحدّث بياناته إن كان موجودًا */
+async function registerUser(tgUser, startParam) {
+  const id = Number(tgUser.id), c = await CFG();
+  const set = { last_name: String(tgUser.last_name || '').slice(0, 64), username: String(tgUser.username || '').slice(0, 64), lastSeen: Date.now() };
+  if (tgUser.first_name) set.first_name = String(tgUser.first_name).slice(0, 64);
+  if (tgUser.photo_url) set.photo_url = String(tgUser.photo_url).slice(0, 300);
+  const welcome = c.welcomeBonus > 0 ? r2(c.welcomeBonus) : 0;
+  const ins = mkUser(id, { balance: welcome, totalEarned: welcome, history: welcome ? [{ type: 'welcome', amount: welcome, at: Date.now() }] : [] });
+  for (const k of Object.keys(set)) delete ins[k];
+
+  let res;
+  for (let i = 0; i < 2; i++) { // إعادة محاولة واحدة عند سباق الإنشاء (E11000) — الطرف الآخر هو من أنشأ ويتولى الإحالة
+    try { res = await users.findOneAndUpdate({ _id: id }, { $set: set, $setOnInsert: ins }, { upsert: true, returnDocument: 'after', includeResultMetadata: true }); break; }
+    catch (e) { if (e.code !== 11000 || i) throw e; }
+  }
+  let u = res.value;
+  const created = !(res.lastErrorObject && res.lastErrorObject.updatedExisting);
+  let inviter = null;
+  if (created && !u.banned) {
+    try { inviter = await applyReferral(u, parseRef(startParam), c); }
+    catch (e) { console.error('referral:', e.message); }
+    if (inviter) { u = await getUser(id); await notifyInviter(inviter, c.referralReward); }
+  }
+  return { u, created, inviter };
+}
+
+/** رسالة من البوت للمُحيل (تفشل بصمت إن لم يبدأ محادثة مع البوت) */
+async function notifyInviter(inviter, reward) {
+  if (!BOT_TOKEN) return;
+  try { await tgCall('sendMessage', { chat_id: inviter.id, text: `🎉 انضم صديق جديد عبر رابطك!\nأُضيفت مكافأة الإحالة (${r2(reward)}) إلى رصيدك.` }); }
+  catch { /* اختياري */ }
 }
 
 /* ───────────── التحقق من هوية تيليجرام ───────────── */
@@ -276,22 +318,8 @@ async function auth(req, res, next) {
     const id = Number(tg.user.id);
     if (!Number.isSafeInteger(id) || id <= 0) fail('bad_session', 401);
 
-    const set = { last_name: String(tg.user.last_name || '').slice(0, 64), username: String(tg.user.username || '').slice(0, 64), lastSeen: Date.now() };
-    if (tg.user.first_name) set.first_name = String(tg.user.first_name).slice(0, 64);
-    if (tg.user.photo_url) set.photo_url = String(tg.user.photo_url).slice(0, 300);
-    const ins = mkUser(id);
-    for (const k of Object.keys(set)) delete ins[k];
-
-    let u;
-    for (let i = 0; i < 2; i++) { // إعادة محاولة واحدة عند سباق الإنشاء (E11000)
-      try { u = await users.findOneAndUpdate({ _id: id }, { $set: set, $setOnInsert: ins }, { upsert: true, returnDocument: 'after' }); break; }
-      catch (e) { if (e.code !== 11000 || i) throw e; }
-    }
+    const { u } = await registerUser(tg.user, req.query.start_param || tg.start_param);
     if (u.banned) fail('banned', 403);
-    if (u.onboarded === false) { // حسابات قديمة (بدون الحقل) تُعتبر مكتملة
-      const won = await users.findOneAndUpdate({ _id: id, onboarded: false }, { $set: { onboarded: true } }); // طلب واحد فقط يفوز
-      if (won) { await onboard(u, req.query.start_param || tg.start_param); u = await getUser(id); }
-    }
     req.tg = tg; req.u = u;
     next();
   } catch (e) { next(e); }
@@ -327,9 +355,7 @@ app.use(async (req, res, next) => { // انتظار الاتصال بقاعدة 
       : n === 'MongoParseError' || /Invalid (scheme|connection string)|must begin with|URI/i.test(m) ? 'invalid_uri_format'
       : n === 'MongoServerSelectionError' ? 'cannot_reach_atlas_check_network_access_0.0.0.0/0'
       : /Cannot find module/i.test(m) ? 'mongodb_package_missing' : n || 'unknown';
-    res.status(503).json({ success: false, code: 'db_unavailable', message: 'قاعدة البيانات غير متاحة', hint,
-      // تشخيص مؤقت (لا يكشف كلمة المرور) — احذفه بعد حل المشكلة
-      dbg: { user: (MONGODB_URI.match(/\/\/([^:]+):/) || [])[1], pwLen: ((MONGODB_URI.match(/\/\/[^:]+:(.*)@/) || [])[1] || '').length, host: (MONGODB_URI.match(/@([^/?]+)/) || [])[1], db: MONGODB_DB, err: String(e.message).slice(0, 120) } });
+    res.status(503).json({ success: false, code: 'db_unavailable', message: 'قاعدة البيانات غير متاحة', hint });
   }
 });
 
@@ -353,9 +379,17 @@ app.get('/api/config', wrap(async () => ({ config: await CFG() })));
 /* ═══════════════ webhook البوت (احتساب إحالة /start ref_<id>) ═══════════════
    خارج /api عمدًا حتى لا يخضع لحدّ المعدّل العام (كل الطلبات من خوادم تيليجرام). */
 const tgCall = async (method, body) => {
-  const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}), signal: AbortSignal.timeout(8000) });
   return r.json();
 };
+
+/** يسجّل webhook البوت ويعيد النتيجة + حالته عند تيليجرام (آخر خطأ وعدد الرسائل المعلّقة) */
+async function setupWebhook(base) {
+  const url = `${base}/telegram/webhook`;
+  const r = await tgCall('setWebhook', { url, secret_token: WEBHOOK_SECRET, allowed_updates: ['message'] }).catch((e) => ({ ok: false, description: e.message }));
+  const i = await tgCall('getWebhookInfo').catch(() => null);
+  return { success: !!r.ok, webhook_url: url, telegram: r, info: i && i.result ? { url: i.result.url, pending: i.result.pending_update_count, last_error: i.result.last_error_message || null } : null };
+}
 
 async function ensureWebhook() { // يُسجَّل مرة واحدة فقط ما لم يتغير الرابط أو السر
   if (!BOT_TOKEN || !PUBLIC_URL || !WEBHOOK_SECRET) return;
@@ -380,12 +414,8 @@ async function handleUpdate(up) {
   if (!m || !m.from || m.from.is_bot || !m.chat || m.chat.type !== 'private') return;
   const t = /^\/start(?:@\w+)?(?:\s+(\S+))?/.exec(String(m.text || ''));
   if (!t) return;
-  const uid = Number(m.from.id), ref = parseRef(t[1]), inviter = ref ? await getUser(ref) : null;
-  // تُسجَّل الإحالة فقط لمن لم يدخل التطبيق من قبل، وأول إحالة صالحة هي المعتمدة
-  if (inviter && !inviter.banned && ref !== uid && !(await getUser(uid))) {
-    await pendingC.deleteOne({ _id: uid, exp: { $lte: new Date() } });
-    await pendingC.updateOne({ _id: uid }, { $setOnInsert: { ref, at: Date.now(), exp: new Date(Date.now() + PENDING_TTL) } }, { upsert: true });
-  }
+  // ضغط Start ينشئ الحساب فورًا ويحتسب الإحالة (تُحتسب فقط عند الإنشاء الأول، فلا تتكرر مهما تكرر Start)
+  try { await registerUser(m.from, t[1]); } catch (e) { console.error('start-register:', e.message); }
   await sendWelcome(m.chat.id);
 }
 
@@ -394,6 +424,15 @@ app.post('/telegram/webhook', async (req, res) => {
   try { await handleUpdate(req.body); } catch (e) { console.error('webhook:', e.message); }
   res.sendStatus(200); // الرد بعد المعالجة (مطلوب في بيئات serverless)
 });
+
+// تسجيل/فحص الـ webhook بضغطة واحدة: افتح في المتصفح  https://<دومين-الخادم>/telegram/setup?key=<WEBHOOK_SECRET>
+// (اضبط WEBHOOK_SECRET صراحةً في متغيرات البيئة لتعرف قيمته). النتيجة تُظهر last_error إن كان تيليجرام لا يستطيع الوصول للخادم.
+app.get('/telegram/setup', limiter('tgsetup', 10, 60000), wrap(async (req) => {
+  if (!BOT_TOKEN || !WEBHOOK_SECRET) fail('not_found', 404);
+  if (!safeEq(String(req.query.key || ''), WEBHOOK_SECRET)) fail('unauthorized', 403);
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
+  return setupWebhook(PUBLIC_URL || `https://${host}`);
+}));
 
 /* ═══════════════ المستخدم ═══════════════ */
 const U = express.Router();
@@ -685,7 +724,6 @@ const ADMIN = {
     const x = await AU(b.id);
     await users.deleteOne({ _id: x.id });
     await users.updateMany({ invitedBy: x.id }, { $set: { invitedBy: 0 } });
-    await pendingC.deleteOne({ _id: x.id });
     return { ok: true };
   },
   withdrawals: async (b) => {
@@ -707,6 +745,13 @@ const ADMIN = {
     if (!r.modifiedCount) fail('done', 409);
     if (status === 'rejected') await credit({ _id: x._id }, 'admin', w.amount, { ref: 'إرجاع سحب مرفوض' }, { earn: false });
     return { ok: true };
+  },
+  // يسجّل webhook البوت ويعرض حالته (للتشخيص من لوحة الإدارة)
+  webhook: async (b) => {
+    if (!BOT_TOKEN || !WEBHOOK_SECRET) fail('not_found', 404);
+    const base = String(b.baseUrl || PUBLIC_URL || '').replace(/\/+$/, '');
+    if (!/^https:\/\//i.test(base)) fail('bad_value');
+    return setupWebhook(base);
   },
   settings: async () => ({ settings: await RAW() }),
   saveSettings: async (b) => {
@@ -759,7 +804,7 @@ const ADMIN = {
   // إعادة ضبط كل البيانات (تجريبي — معطّل افتراضيًا لأنه يمسح قاعدة البيانات بالكامل)
   reset: async () => {
     if (!DEMO_TOOLS) fail('not_found', 404);
-    await Promise.all([users, tasksC, promos, settingsC, pendingC, metaC].map((c) => c.deleteMany({})));
+    await Promise.all([users, tasksC, promos, settingsC, metaC].map((c) => c.deleteMany({})));
     cfgCache = { at: 0, v: null };
     await seedTasks();
     return { ok: true };
