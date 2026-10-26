@@ -84,6 +84,10 @@ const DEMO_TOOLS = process.env.ADMIN_DEMO_TOOLS === '1';
 const PUBLIC_URL = (process.env.PUBLIC_URL || (process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : '')).replace(/\/+$/, '');
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || derive('webhook').slice(0, 48);
 const APP_URL = process.env.APP_URL || '';
+// روابط رسالة الترحيب (/start) — يمكن تغييرها من متغيرات البيئة دون تعديل الكود
+const FRONTEND_URL = APP_URL || 'https://glistening-shortbread-e55027.netlify.app'; // رابط التطبيق (زر «اربح الان»)
+const CHANNEL_URL = process.env.CHANNEL_URL || 'https://t.me/moneyslayerchannel';  // رابط القناة
+const GROUP_URL = process.env.GROUP_URL || 'https://t.me/moneyslayergroup';        // رابط المجموعة
 const INIT_MAX_AGE = 24 * 3600; // ثانية — عمر initData المسموح
 const DAY = 86400000;
 
@@ -423,11 +427,20 @@ async function ensureWebhook() { // يُسجَّل مرة واحدة فقط ما
 }
 
 async function sendWelcome(chatId) {
-  const c = await CFG(), bot = String(c.botUsername || '').replace(/^@/, '');
-  let button = null;
-  if (APP_URL) button = { text: '🚀 افتح التطبيق', web_app: { url: APP_URL } };
-  else if (c.miniAppName && bot) button = { text: '🚀 افتح التطبيق', url: `https://t.me/${bot}/${c.miniAppName}` };
-  await tgCall('sendMessage', { chat_id: chatId, text: `أهلًا بك في ${c.appName} 👋\nاضغط الزر بالأسفل لفتح التطبيق وابدأ بجمع الأرباح.`, ...(button ? { reply_markup: { inline_keyboard: [[button]] } } : {}) });
+  // رسالة الترحيب تُرسل لكل من يضغط /start (عبر الـ webhook، دون polling حتى لا يتعارض مع الاستضافة serverless)
+  const welcomeText = `*✅ اهلا وسهلا بك في تطبيق Money Slayer للربح من المنزل بدون مجهود وبسهولة تامة ونطلق على مشروعنا " مملكة الربح السريع " اضغط هنا على اربح الان الموجودة في الاسفل واكسب 👇💎*`;
+  await tgCall('sendMessage', {
+    chat_id: chatId,
+    text: welcomeText,
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: 'اربح الان 💸', web_app: { url: FRONTEND_URL } }],          // فتح التطبيق
+        [{ text: 'اشترك في قناتنا 💎', url: CHANNEL_URL }],                  // القناة
+        [{ text: 'انضم لمجموعتنا على تلجرام 💡', url: GROUP_URL }],         // المجموعة
+      ],
+    },
+  });
 }
 
 async function handleUpdate(up) {
