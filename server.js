@@ -43,8 +43,8 @@
      GET  /api/referrals
      POST /api/referrals/milestone    {friends}
      POST /api/promo/redeem           {code}
-     POST /api/ads/start
-     POST /api/ads/claim
+     POST /api/ads/start    يبدأ جلسة مشاهدة (يعيد duration/reward/zoneId)
+     POST /api/ads/claim    يصرف المكافأة فقط بعد مرور duration كاملة منذ start وبعد انتهاء المؤقت بين الإعلانين
      POST /api/withdraw               {method,amount,address} | {method:'bank',amount,address,bank,holder,country,countryName}
    الإدارة (POST /api/admin/:action — ترويسة x-admin-token ما عدا login)
      login · stats · users · user · balance · ban · delete · webhook
@@ -104,7 +104,9 @@ const DEFAULT_CONFIG = {
   chestReward: 0.3,
   spinPrizes: [0.05, 0.1, 0.02, 0.25, 0.05, 0.5, 0.1, 1],
   milestones: [{ friends: 5, bonus: 2 }, { friends: 10, bonus: 5 }, { friends: 25, bonus: 15 }, { friends: 50, bonus: 40 }],
-  ads: { enabled: true, reward: 0.02, dailyLimit: 50, duration: 15, cooldown: 10, blockId: '' },
+  // ads (تُدار كلها من لوحة الأدمن عبر saveSettings): reward = مكافأة الإعلان · cooldown = المؤقت بين إعلانين (ثانية) · duration = أقل مدة مشاهدة قبل صرف المكافأة (ثانية) · dailyLimit = حد يومي
+  //      zoneId = رقم منطقة SDK الإعلانات (libtl.com) — يقرؤه التطبيق من /api/config ويستدعي show_<zoneId>()
+  ads: { enabled: true, reward: 0.02, dailyLimit: 50, duration: 15, cooldown: 10, blockId: '', zoneId: '12092133' },
   botUsername: 'Moneyslayer1_bot',
   miniAppName: 'app',
   channel: '',
@@ -170,6 +172,25 @@ async function connect() {
 let ready = null;
 const dbReady = () => ready || (ready = connect().catch((e) => { ready = null; throw e; }));
 
+/** تنظيف إعدادات الإعلانات القادمة من لوحة الأدمن: قيم رقمية ضمن حدود معقولة، وما لم يُرسل يبقى كما هو */
+function sanitizeAds(inp, cur) {
+  if (!inp || typeof inp !== 'object') fail('bad_value');
+  const num = (v, old, min, max, dec = 0) => {
+    if (v === undefined || v === null || v === '') return old;
+    const n = Number(v); if (!Number.isFinite(n) || n < min || n > max) fail('bad_value');
+    return dec ? Math.round(n * 10 ** dec) / 10 ** dec : Math.round(n);
+  };
+  const out = { ...cur, ...inp };
+  out.enabled = inp.enabled === undefined ? cur.enabled !== false : !!inp.enabled;
+  out.reward = num(inp.reward, cur.reward, 0, 100, 4);        // مكافأة الإعلان الواحد
+  out.cooldown = num(inp.cooldown, cur.cooldown, 0, 86400);   // المؤقت بين إعلانين (ثانية)
+  out.duration = num(inp.duration, cur.duration, 1, 600);     // أقل مدة مشاهدة (ثانية)
+  out.dailyLimit = num(inp.dailyLimit, cur.dailyLimit, 1, 10000);
+  out.zoneId = String(inp.zoneId === undefined ? (cur.zoneId || '') : inp.zoneId).replace(/[^0-9A-Za-z_-]/g, '').slice(0, 40);
+  out.blockId = String(inp.blockId === undefined ? (cur.blockId || '') : inp.blockId).slice(0, 60);
+  return out;
+}
+
 /* الإعدادات (تُخزَّن في settings/main وتُدمج مع الافتراضية، مع ذاكرة مؤقتة قصيرة) */
 let cfgCache = { at: 0, v: null };
 async function RAW() {
@@ -226,7 +247,7 @@ async function profileOf(u) {
   };
 }
 const publicTask = (t, u) => {
-  const { verifyChat, verifySeconds, _id, ord, ...pub } = t; // eslint-disable-line no-unused-vars
+  const { verifyChat, verifyMembership, verifySeconds, _id, ord, ...pub } = t; // eslint-disable-line no-unused-vars
   const st = (u.taskState || {})[t.id] || {};
   return { ...pub, status: st.status || 'available', verifyAt: st.verifyAt || 0 };
 };
@@ -467,14 +488,25 @@ U.post('/tasks/start', wrap(async (req) => {
   return { task: publicTask(t, { taskState: { [id]: st } }), url: t.url };
 }));
 
-// التحقق الفعلي من عضوية قناة/مجموعة تيليجرام (اختياري عبر task.verifyChat)
+/* التحقق الفعلي من مهام تيليجرام (انضمام لقناة/مجموعة): لا مكافأة إن لم يكن المستخدم عضوًا فعلًا.
+   الهدف يُحدَّد بـ task.verifyChat (مثل @channel أو -100123…) أو يُستنتج تلقائيًا من رابط t.me/<اسم> العام.
+   لإيقاف التحقق التلقائي لمهمة معيّنة اجعل verifyMembership=false. شرط العمل: البوت مشرف في القناة/المجموعة. */
+function verifyTarget(t) {
+  if (t.verifyChat) return String(t.verifyChat).trim();
+  if (t.verifyMembership === false) return '';
+  const m = /^https?:\/\/(?:www\.)?(?:t|telegram)\.me\/([A-Za-z][A-Za-z0-9_]{3,31})(?:\/\d+)?\/?(?:\?.*)?$/i.exec(String(t.url || '').trim());
+  if (!m || /bot$/i.test(m[1])) return ''; // روابط البوتات والدعوات الخاصة لا يمكن التحقق منها تلقائيًا
+  return `@${m[1]}`;
+}
+
 async function isChatMember(chat, userId) {
   if (!BOT_TOKEN) return false;
   try {
-    const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember?chat_id=${encodeURIComponent(chat)}&user_id=${userId}`);
+    const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember?chat_id=${encodeURIComponent(chat)}&user_id=${userId}`, { signal: AbortSignal.timeout(8000) });
     const j = await r.json();
-    return !!j.ok && ['creator', 'administrator', 'member', 'restricted'].includes(j.result?.status);
-  } catch { return false; }
+    if (!j.ok) { console.warn(`[verify] getChatMember ${chat}: ${j.description || 'error'} — تأكد أن البوت مشرف في القناة/المجموعة`); return false; }
+    return ['creator', 'administrator', 'member', 'restricted'].includes(j.result?.status) && j.result?.is_member !== false;
+  } catch (e) { console.warn('[verify]', e.message); return false; }
 }
 
 // POST /api/tasks/claim {id}
@@ -487,7 +519,8 @@ U.post('/tasks/claim', wrap(async (req) => {
   if (st?.status === 'done') fail('task_done', 409);
   if (!st) fail('task_pending', 409);
   if (Date.now() < st.verifyAt) fail('task_pending', 409, { wait: Math.ceil((st.verifyAt - Date.now()) / 1000) });
-  if (t.verifyChat) {
+  const vChat = verifyTarget(t);
+  if (vChat) {
     // قفل ضد الاستلام المزدوج أثناء انتظار تيليجرام (ينتهي تلقائيًا بعد 60 ثانية)
     const lk = await users.updateOne(
       { _id: u.id, [`${p}.status`]: 'started', $or: [{ [`${p}.claiming`]: { $exists: false } }, { [`${p}.claiming`]: { $lt: Date.now() - 60000 } }] },
@@ -495,8 +528,8 @@ U.post('/tasks/claim', wrap(async (req) => {
     );
     if (!lk.matchedCount) fail('task_pending', 409);
     let ok = false;
-    try { ok = await isChatMember(t.verifyChat, u.id); } finally { await users.updateOne({ _id: u.id }, { $unset: { [`${p}.claiming`]: '' } }); }
-    if (!ok) fail('task_pending', 409, { wait: 5 });
+    try { ok = await isChatMember(vChat, u.id); } finally { await users.updateOne({ _id: u.id }, { $unset: { [`${p}.claiming`]: '' } }); }
+    if (!ok) fail('not_joined', 409, { wait: 5, message: 'لم يتم التحقق من تنفيذ المهمة — انضم أولًا ثم اضغط استلام' });
   }
   const day = dayKey();
   const nu = await credit({ _id: u.id, [`${p}.status`]: 'started' }, 'task', t.reward, { ref: t.title },
@@ -596,29 +629,35 @@ U.post('/promo/redeem', limiter('promo', 10, 60000, (r) => r.u.id), wrap(async (
   return { profile: await profileOf(nu), reward: p.reward };
 }));
 
-// POST /api/ads/start
+// POST /api/ads/start — يبدأ جلسة مشاهدة (الوقت يُسجَّل من الخادم). المؤقت بين الإعلانين وحدّه اليومي من إعدادات الأدمن
 U.post('/ads/start', wrap(async (req) => {
-  const u = req.u, a = (await CFG()).ads, done = (u.adDays || {})[dayKey()] || 0;
+  const u = req.u, a = (await CFG()).ads, now = Date.now(), done = (u.adDays || {})[dayKey()] || 0;
   if (!a.enabled) fail('ads_disabled', 403);
   if (done >= a.dailyLimit) fail('ads_limit', 409);
-  if (u.lastAd && Date.now() < u.lastAd + a.cooldown * 1000) fail('ads_wait', 429, { wait: Math.ceil((u.lastAd + a.cooldown * 1000 - Date.now()) / 1000) });
-  const nu = await mutate({ _id: u.id }, { set: { adSession: Date.now() } });
-  return { duration: a.duration, reward: a.reward, ads: (await profileOf(nu)).ads };
+  const nextAt = u.lastAd ? u.lastAd + a.cooldown * 1000 : 0;
+  if (nextAt && now < nextAt) fail('ads_wait', 429, { wait: Math.ceil((nextAt - now) / 1000) });
+  const nu = await mutate({ _id: u.id }, { set: { adSession: now } });
+  return { duration: a.duration, reward: a.reward, zoneId: a.zoneId || '', ads: (await profileOf(nu)).ads };
 }));
 
-// POST /api/ads/claim
+// POST /api/ads/claim — لا تُصرف المكافأة إلا بعد مرور مدة الإعلان كاملة (duration) منذ start، ومرة واحدة لكل جلسة
 U.post('/ads/claim', wrap(async (req) => {
-  const u = req.u, a = (await CFG()).ads, day = dayKey(), done = (u.adDays || {})[day] || 0;
+  const u = req.u, a = (await CFG()).ads, now = Date.now(), day = dayKey(), done = (u.adDays || {})[day] || 0;
   if (!a.enabled) fail('ads_disabled', 403);
   if (!u.adSession) fail('ads_pending', 409);
   if (done >= a.dailyLimit) fail('ads_limit', 409);
-  const minWait = a.blockId ? 3 : a.duration; // مع Adsgram مدة الإعلان يحددها المعلن
-  const left = Math.ceil((u.adSession + minWait * 1000 - Date.now()) / 1000);
+  const left = Math.ceil((u.adSession + a.duration * 1000 - now) / 1000); // مدة المشاهدة الكاملة من إعدادات الأدمن
   if (left > 0) fail('ads_pending', 409, { wait: left });
+  if (now - u.adSession > 30 * 60000) { // جلسة قديمة جدًا: تُلغى ويُطلب إعلان جديد
+    await users.updateOne({ _id: u.id, adSession: u.adSession }, { $set: { adSession: 0 } });
+    fail('ads_pending', 409);
+  }
+  const nextAt = u.lastAd ? u.lastAd + a.cooldown * 1000 : 0; // المؤقت بين إعلانين يُفرض هنا أيضًا
+  if (nextAt && now < nextAt) fail('ads_wait', 429, { wait: Math.ceil((nextAt - now) / 1000) });
   const ap = `adDays.${day}`;
   const nu = await credit(
     { _id: u.id, adSession: u.adSession, $or: [{ [ap]: { $exists: false } }, { [ap]: { $lt: a.dailyLimit } }] }, 'gift', a.reward, { ref: 'مشاهدة إعلان' },
-    { set: { adSession: 0, lastAd: Date.now() }, inc: { [ap]: 1 }, expr: { adsEarned: rnd('$adsEarned', r2(a.reward)) } },
+    { set: { adSession: 0, lastAd: now }, inc: { [ap]: 1 }, expr: { adsEarned: rnd('$adsEarned', r2(a.reward)) } },
   );
   if (!nu) fail('ads_pending', 409);
   return { profile: await profileOf(nu), reward: a.reward };
@@ -758,6 +797,7 @@ const ADMIN = {
     if (!b.settings || typeof b.settings !== 'object') fail('bad_value');
     const s = { ...b.settings }; delete s.demo; delete s._id;
     for (const k of Object.keys(s)) if (k.startsWith('$') || k.includes('.')) delete s[k];
+    if (s.ads !== undefined) s.ads = sanitizeAds(s.ads, (await RAW()).ads); // أرقام آمنة فقط (مكافأة/مؤقت/مدة/حد يومي)
     if (Object.keys(s).length) await settingsC.updateOne({ _id: 'main' }, { $set: s }, { upsert: true });
     cfgCache = { at: 0, v: null };
     return { settings: await RAW() };
@@ -828,7 +868,7 @@ app.post('/api/admin/:action', limiter('admin', 60, 60000), (req, res, next) => 
 app.use('/api', U);
 
 /* ───────────── 404 + معالج الأخطاء (HTTP مناسب + {code,message}) ───────────── */
-const MSG = { not_telegram: 'افتح التطبيق من داخل تيليجرام', bad_session: 'جلسة غير صالحة', expired: 'انتهت الجلسة', banned: 'الحساب محظور', not_found: 'غير موجود', rate_limited: 'طلبات كثيرة، حاول لاحقًا' };
+const MSG = { not_joined: 'لم يتم التحقق من تنفيذ المهمة', ads_pending: 'لم تكتمل مدة الإعلان بعد', ads_wait: 'انتظر قبل الإعلان التالي', not_telegram: 'افتح التطبيق من داخل تيليجرام', bad_session: 'جلسة غير صالحة', expired: 'انتهت الجلسة', banned: 'الحساب محظور', not_found: 'غير موجود', rate_limited: 'طلبات كثيرة، حاول لاحقًا' };
 app.use((req, res) => res.status(404).json({ success: false, code: 'not_found', message: 'المسار غير موجود' }));
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   if (err instanceof AppError) return res.status(err.status).json({ success: false, code: err.code, message: MSG[err.code] || err.code, ...err.extra });
