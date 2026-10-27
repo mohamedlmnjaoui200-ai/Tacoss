@@ -20,17 +20,19 @@
      ADMIN_SECRET    سر توقيع توكن الأدمن (ثابت! وإلا تنتهي الجلسات مع كل إعادة تشغيل)
      ALLOWED_ORIGIN  دومين التطبيق لـ CORS (أكثر من واحد مفصولة بفاصلة؛ * للتجربة فقط)
      PUBLIC_URL      الرابط العام لهذا الخادم https://api.example.com — لتسجيل webhook البوت تلقائيًا
-     WEBHOOK_SECRET  سر webhook (حروف/أرقام/_/- فقط) — مطلوب لاحتساب الإحالة عند ضغط Start في البوت
+     WEBHOOK_SECRET  سر webhook (حروف/أرقام/_/- فقط) — مطلوب لحفظ المُحيل عند ضغط Start (تُحتسب الإحالة عند أول دخول للتطبيق)
      APP_URL         رابط التطبيق المصغّر https://your-app.vercel.app — لزر «افتح التطبيق» في رد البوت
      DEV_MODE=1      يسمح بالترويسة x-dev-user-id بدل initData (للتطوير فقط!)
      ADMIN_DEMO_TOOLS=1  يفعّل أمري الأدمن التجريبيين simInvite و reset (reset يمسح كل البيانات! — للتجربة فقط)
 
    ───────────────────────── قائمة كل المسارات ─────────────────────────
+   لعبة الصاروخ (RocketCrash): جولات مشتركة بين كل اللاعبين وبالرصيد الحقيقي؛ كل الحساب (الرهان/نقطة الانهيار/السحب/الأرباح) على الخادم فقط.
+   قواعدها {enabled,minBet,maxBet,waitSec,rtp} تُخزَّن في settings.crash وتصل التطبيق عبر GET /api/config
    عام
      GET  /health
      GET  /telegram/setup?key=<WEBHOOK_SECRET>   تسجيل webhook البوت وعرض حالته (للتشخيص)
      GET  /api/config
-     POST /telegram/webhook   (من تيليجرام فقط — ترويسة X-Telegram-Bot-Api-Secret-Token) ضغط /start ref_<id> ينشئ الحساب ويحتسب الإحالة فورًا
+     POST /telegram/webhook   (من تيليجرام فقط — ترويسة X-Telegram-Bot-Api-Secret-Token) ضغط /start ref_<id> ينشئ الحساب ويؤجّل الإحالة حتى يفتح المستخدم التطبيق فعلًا
    المستخدم (ترويسة x-telegram-init-data)
      GET  /api/user/profile?start_param=
      GET  /api/tasks
@@ -38,7 +40,6 @@
      POST /api/tasks/claim            {id}
      POST /api/checkin
      POST /api/chest
-     POST /api/spin
      GET  /api/leaderboard
      GET  /api/referrals
      POST /api/referrals/milestone    {friends}
@@ -46,9 +47,13 @@
      POST /api/ads/start    يبدأ جلسة مشاهدة (يعيد duration/reward/zoneId)
      POST /api/ads/claim    يصرف المكافأة فقط بعد مرور duration كاملة منذ start وبعد انتهاء المؤقت بين الإعلانين
      POST /api/withdraw               {method,amount,address} | {method:'bank',amount,address,bank,holder,country,countryName}
+     GET  /api/crash/state            حالة الجولة المشتركة + رهاناتي + اللاعبون + السجل + رصيدي (يستعلم عنها التطبيق دوريًا)
+     POST /api/crash/bet              {slot:0|1, amount, autoAt?}   يخصم الرهان فورًا (قبل الإقلاع فقط)
+     POST /api/crash/cancel           {slot}                        يلغي الرهان ويعيد المبلغ (قبل الإقلاع فقط)
+     POST /api/crash/cashout          {slot}                        يسحب عند المضاعف الحالي المحسوب على الخادم
    الإدارة (POST /api/admin/:action — ترويسة x-admin-token ما عدا login)
      login · stats · users · user · balance · ban · delete · webhook
-     withdrawals · withdrawal · settings · saveSettings
+     withdrawals · withdrawal · settings · saveSettings (تشمل ads و crash — لعبة الصاروخ)
      tasks · saveTask · deleteTask · promos · savePromo · deletePromo
      simInvite · reset   (تجريبيان — يعملان فقط مع ADMIN_DEMO_TOOLS=1)
    ════════════════════════════════════════════════════════════════════════ */
@@ -106,11 +111,13 @@ const DEFAULT_CONFIG = {
   checkinRewards: [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.5],
   dailyGoal: 3,
   chestReward: 0.3,
-  spinPrizes: [0.05, 0.1, 0.02, 0.25, 0.05, 0.5, 0.1, 1],
   milestones: [{ friends: 5, bonus: 2 }, { friends: 10, bonus: 5 }, { friends: 25, bonus: 15 }, { friends: 50, bonus: 40 }],
   // ads (تُدار كلها من لوحة الأدمن عبر saveSettings): reward = مكافأة الإعلان · cooldown = المؤقت بين إعلانين (ثانية) · duration = أقل مدة مشاهدة قبل صرف المكافأة (ثانية) · dailyLimit = حد يومي
   //      zoneId = رقم منطقة SDK الإعلانات (libtl.com) — يقرؤه التطبيق من /api/config ويستدعي show_<zoneId>()
   ads: { enabled: true, reward: 0.02, dailyLimit: 50, duration: 15, cooldown: 10, blockId: '', zoneId: '12092133' },
+  // crash: لعبة الصاروخ التجريبية — enabled = إظهار زر اللعبة · startBalance = الرصيد التجريبي الابتدائي · minBet/maxBet = حدود الرهان · waitSec = الانتظار بين الجولات (ثانية) · rtp = نسبة العائد للاعب %
+  //        الحد الأقصى للمضاعف ثابت 22× (CRASH_CAP) · الرهان من 0.3 إلى 1000 · rtp=88 يعني ميزة معلنة للمنصة 12% على كل الرهانات
+  crash: { enabled: true, startBalance: 1000, minBet: 0.3, maxBet: 1000, waitSec: 5, rtp: 88 },
   botUsername: 'Moneyslayer1_bot',
   miniAppName: 'app',
   channel: '',
@@ -150,7 +157,7 @@ const fail = (code, status = 400, extra = {}) => { throw new AppError(code, stat
    المجموعات: users (_id = معرّف تيليجرام) · tasks · promos (_id = الكود) · settings · meta
    كل تعديل على الرصيد يتم بتحديث ذرّي واحد (pipeline update) مع شرط في الفلتر،
    فلا يمكن لطلبين متزامنين خصم نفس الرصيد مرتين أو استلام نفس المكافأة مرتين. */
-let users, tasksC, promos, settingsC, metaC;
+let users, tasksC, promos, settingsC, metaC, crashC, crashBets;
 
 async function seedTasks() {
   const first = await metaC.updateOne({ _id: 'seeded' }, { $setOnInsert: { at: Date.now() } }, { upsert: true });
@@ -165,9 +172,12 @@ async function connect() {
   const db = client.db(MONGODB_DB);
   users = db.collection('users'); tasksC = db.collection('tasks'); promos = db.collection('promos');
   settingsC = db.collection('settings'); metaC = db.collection('meta');
+  crashC = db.collection('crashRounds'); crashBets = db.collection('crashBets');
   await Promise.all([
     users.createIndex({ invitedBy: 1 }), users.createIndex({ totalEarned: -1 }), users.createIndex({ joinedAt: -1 }),
     users.createIndex({ 'withdrawals.id': 1 }), promos.createIndex({ createdAt: -1 }),
+    crashBets.createIndex({ round: 1, status: 1 }), crashBets.createIndex({ round: 1, uid: 1 }),
+    crashBets.createIndex({ at: 1 }, { expireAfterSeconds: 7 * 86400 }), crashC.createIndex({ at: 1 }, { expireAfterSeconds: 7 * 86400 }),
   ]);
   await seedTasks();
   await ensureWebhook().catch((e) => console.error('setWebhook:', e.message));
@@ -195,12 +205,33 @@ function sanitizeAds(inp, cur) {
   return out;
 }
 
+/** تنظيف إعدادات لعبة الصاروخ القادمة من لوحة الأدمن (نفس حدود التحقق في AdminView) */
+function sanitizeCrash(inp, cur) {
+  if (!inp || typeof inp !== 'object') fail('bad_value');
+  const num = (v, old, min, max, dec = 2) => {
+    if (v === undefined || v === null || v === '') return old;
+    const n = Number(v); if (!Number.isFinite(n) || n < min || n > max) fail('bad_value');
+    return Math.round(n * 10 ** dec) / 10 ** dec;
+  };
+  const c = { ...DEFAULT_CONFIG.crash, ...(cur || {}) };
+  const out = {
+    enabled: inp.enabled === undefined ? c.enabled !== false : !!inp.enabled,
+    startBalance: num(inp.startBalance, c.startBalance, 0, 1e7),
+    minBet: num(inp.minBet, c.minBet, 0.01, 1e7),
+    maxBet: num(inp.maxBet, c.maxBet, 0.01, 1e7),
+    waitSec: num(inp.waitSec, c.waitSec, 3, 60, 0),
+    rtp: num(inp.rtp, c.rtp, 50, 99.9, 1),
+  };
+  if (out.maxBet < out.minBet) fail('bad_value');
+  return out;
+}
+
 /* الإعدادات (تُخزَّن في settings/main وتُدمج مع الافتراضية، مع ذاكرة مؤقتة قصيرة) */
 let cfgCache = { at: 0, v: null };
 async function RAW() {
   if (cfgCache.v && Date.now() - cfgCache.at < 2000) return cfgCache.v;
   const d = (await settingsC.findOne({ _id: 'main' })) || {}; delete d._id;
-  const v = { ...DEFAULT_CONFIG, ...d, ads: { ...DEFAULT_CONFIG.ads, ...(d.ads || {}) } };
+  const v = { ...DEFAULT_CONFIG, ...d, ads: { ...DEFAULT_CONFIG.ads, ...(d.ads || {}) }, crash: { ...DEFAULT_CONFIG.crash, ...(d.crash || {}) } };
   cfgCache = { at: Date.now(), v };
   return v;
 }
@@ -209,7 +240,7 @@ const CFG = async () => { const c = await RAW(); return { ...c, methods: (c.meth
 const mkUser = (id, o = {}) => ({
   id, first_name: '', last_name: '', username: '', photo_url: '', balance: 0, totalEarned: 0, referralEarnings: 0, completed: 0, streak: 0,
   lastCheckin: 0, lastSpin: 0, lastAd: 0, adSession: 0, adDays: {}, adsEarned: 0, taskState: {}, taskDays: {}, chestDay: '', milestones: [],
-  joinedAt: Date.now(), onboarded: true, history: [], withdrawals: [], invitedBy: 0, refBonus: 0, banned: false, banReason: '', usedPromos: [], lastWithdrawAt: 0, ...o,
+  joinedAt: Date.now(), onboarded: true, history: [], withdrawals: [], invitedBy: 0, pendingRef: 0, refBonus: 0, banned: false, banReason: '', usedPromos: [], lastWithdrawAt: 0, ...o,
 });
 const getUser = (id) => users.findOne({ _id: Number(id) });
 const curStreak = (u) => (Date.now() - u.lastCheckin > 2 * DAY ? 0 : u.streak);
@@ -240,11 +271,11 @@ const dailyOf = (u, c) => ({ done: Math.min((u.taskDays || {})[dayKey()] || 0, c
 
 async function profileOf(u) {
   const c = await CFG(), now = Date.now(), day = dayKey();
-  const claimedToday = u.lastCheckin && now - u.lastCheckin < DAY, spinReady = !u.lastSpin || now - u.lastSpin >= DAY;
+  const claimedToday = u.lastCheckin && now - u.lastCheckin < DAY;
   const friends = await users.countDocuments({ invitedBy: u.id });
   return {
     balance: r2(u.balance), totalEarned: r2(u.totalEarned), completedTasks: u.completed, friends, referralEarnings: r2(u.referralEarnings),
-    referralCode: `ref_${u.id}`, streak: curStreak(u), nextCheckinAt: claimedToday ? u.lastCheckin + DAY : 0, nextSpinAt: spinReady ? 0 : u.lastSpin + DAY, joinedAt: u.joinedAt,
+    referralCode: `ref_${u.id}`, streak: curStreak(u), nextCheckinAt: claimedToday ? u.lastCheckin + DAY : 0, joinedAt: u.joinedAt,
     daily: dailyOf(u, c),
     milestonesClaimed: u.milestones || [], history: (u.history || []).slice(0, 60), withdrawals: (u.withdrawals || []).slice(0, 20),
     ads: { done: (u.adDays || {})[day] || 0, limit: c.ads.dailyLimit, reward: c.ads.reward, duration: c.ads.duration, nextAt: u.lastAd && now < u.lastAd + c.ads.cooldown * 1000 ? u.lastAd + c.ads.cooldown * 1000 : 0 },
@@ -284,8 +315,11 @@ async function applyReferral(u, refId, c) {
   return inviter;
 }
 
-/** ينشئ الحساب إن لم يكن موجودًا (ويحتسب الإحالة عندها فقط)، أو يحدّث بياناته إن كان موجودًا */
-async function registerUser(tgUser, startParam) {
+/** ينشئ الحساب إن لم يكن موجودًا، أو يحدّث بياناته إن كان موجودًا.
+    الإحالة لا تُحتسب إلا عند دخول المستخدم فعليًا إلى التطبيق (طلب موقّع بـ initData):
+    • فتح التطبيق مباشرة لأول مرة (startapp=ref_ID): تُحتسب فورًا.
+    • ضغط Start في البوت (fromBot): يُحفظ المُحيل في pendingRef فقط دون أي مكافأة، وتُحتسب عند أول دخول للتطبيق. */
+async function registerUser(tgUser, startParam, { fromBot = false } = {}) {
   const id = Number(tgUser.id), c = await CFG();
   const set = { last_name: String(tgUser.last_name || '').slice(0, 64), username: String(tgUser.username || '').slice(0, 64), lastSeen: Date.now() };
   if (tgUser.first_name) set.first_name = String(tgUser.first_name).slice(0, 64);
@@ -303,10 +337,23 @@ async function registerUser(tgUser, startParam) {
   const created = !(res.lastErrorObject && res.lastErrorObject.updatedExisting);
   let inviter = null;
   if (created && !u.banned) {
-    try { inviter = await applyReferral(u, parseRef(startParam), c); }
-    catch (e) { console.error('referral:', e.message); }
-    if (inviter) { u = await getUser(id); await notifyInviter(inviter, c.referralReward); }
+    const refId = parseRef(startParam);
+    if (fromBot) { // Start في البوت: تأجيل الإحالة حتى يدخل التطبيق فعلًا
+      if (refId && refId !== id) await users.updateOne({ _id: id, invitedBy: 0 }, { $set: { pendingRef: refId } }).catch((e) => console.error('pendingRef:', e.message));
+    } else {
+      try { inviter = await applyReferral(u, refId, c); }
+      catch (e) { console.error('referral:', e.message); }
+    }
+  } else if (!fromBot && !u.banned && u.pendingRef > 0 && !u.invitedBy) {
+    // أول دخول فعلي للتطبيق بعد Start في البوت: يُحتسب المُحيل المؤجَّل مرة واحدة (حجز ذرّي)
+    const refId = u.pendingRef;
+    const claim = await users.updateOne({ _id: id, pendingRef: refId, invitedBy: 0 }, { $set: { pendingRef: 0 } });
+    if (claim.modifiedCount) {
+      try { inviter = await applyReferral(u, refId, c); }
+      catch (e) { console.error('referral:', e.message); await users.updateOne({ _id: id, pendingRef: 0 }, { $set: { pendingRef: refId } }).catch(() => {}); } // يُعاد المحاولة عند الدخول التالي
+    }
   }
+  if (inviter) { u = await getUser(id); await notifyInviter(inviter, c.referralReward); }
   return { u, created, inviter };
 }
 
@@ -393,7 +440,8 @@ const limiter = (name, max, windowMs, keyFn = (req) => req.ip) => (req, res, nex
   next();
 };
 setInterval(() => { const n = Date.now(); for (const [k, h] of hits) if (n > h.reset) hits.delete(k); }, 60000).unref();
-app.use('/api', limiter('global', 120, 60000));
+const globalLimit = limiter('global', 120, 60000);
+app.use('/api', (req, res, next) => (req.path === '/crash/state' ? next() : globalLimit(req, res, next))); // استعلام الصاروخ الدوري له حدّ خاص به
 
 const wrap = (fn) => (req, res, next) => Promise.resolve().then(() => fn(req, res)).then((out) => { if (out !== undefined && !res.headersSent) res.json(out); }).catch(next);
 
@@ -448,8 +496,8 @@ async function handleUpdate(up) {
   if (!m || !m.from || m.from.is_bot || !m.chat || m.chat.type !== 'private') return;
   const t = /^\/start(?:@\w+)?(?:\s+(\S+))?/.exec(String(m.text || ''));
   if (!t) return;
-  // ضغط Start ينشئ الحساب فورًا ويحتسب الإحالة (تُحتسب فقط عند الإنشاء الأول، فلا تتكرر مهما تكرر Start)
-  try { await registerUser(m.from, t[1]); } catch (e) { console.error('start-register:', e.message); }
+  // ضغط Start ينشئ الحساب فقط ويحفظ المُحيل مؤجَّلًا (pendingRef) — لا مكافأة إحالة حتى يفتح المستخدم التطبيق فعلًا
+  try { await registerUser(m.from, t[1], { fromBot: true }); } catch (e) { console.error('start-register:', e.message); }
   await sendWelcome(m.chat.id);
 }
 
@@ -569,19 +617,6 @@ U.post('/chest', wrap(async (req) => {
   const nu = await credit({ _id: u.id, chestDay: { $ne: dayKey() } }, 'gift', p.reward, { ref: 'صندوق المهام' }, { set: { chestDay: dayKey() } });
   if (!nu) fail('task_done', 409);
   return { profile: await profileOf(nu), reward: p.reward };
-}));
-
-// POST /api/spin — عجلة الحظ (الخادم يختار الجائزة)
-U.post('/spin', wrap(async (req) => {
-  const u = req.u, c = await CFG();
-  if (u.lastSpin && Date.now() - u.lastSpin < DAY) fail('spin_wait', 429);
-  const prizes = c.spinPrizes, w = prizes.map((p) => 1 / (p * p + 0.05));
-  let r = crypto.randomInt(0, 1e9) / 1e9 * w.reduce((a, b) => a + b, 0), index = 0;
-  for (; index < w.length; index++) { r -= w[index]; if (r <= 0) break; }
-  index = Math.min(index, prizes.length - 1);
-  const nu = await credit({ _id: u.id, lastSpin: u.lastSpin }, 'gift', prizes[index], { ref: 'عجلة الحظ' }, { set: { lastSpin: Date.now() } });
-  if (!nu) fail('spin_wait', 429);
-  return { profile: await profileOf(nu), reward: prizes[index], index };
 }));
 
 // GET /api/leaderboard
@@ -709,6 +744,147 @@ U.post('/withdraw', limiter('withdraw', 5, 60000, (r) => r.u.id), wrap(async (re
   return { profile: await profileOf(nu), withdrawal: w };
 }));
 
+/* ═══════════════ لعبة الصاروخ (جولات مشتركة، رصيد حقيقي) ═══════════════
+   • كل الحساب على الخادم: نقطة الانهيار تُولَّد بـ crypto عند إنشاء الجولة وتبقى سرّية حتى تنهار.
+   • الجولة مخزّنة في MongoDB (crashRounds) فتعمل على Vercel (serverless) وعلى خادم دائم بالسلوك نفسه:
+     أي طلب يصل بعد انتهاء الجولة السابقة يُسوّيها ثم ينشئ التالية (إنشاء ذرّي بمفتاح متسلسل _id).
+   • الرهان: إدراج مستند فريد (جولة:لاعب:خانة) ثم خصم ذرّي بشرط الرصيد؛ السحب: «حجز» ذرّي للرهان ثم إضافة الربح.
+   • المضاعف = e^(0.085 × الثواني منذ الإقلاع) مقرَّبًا للأسفل لرقمين؛ السحب بعد الانهيار أو عند المضاعف ≥ نقطة الانهيار = خسارة.
+   • RTP: P(نقطة الانهيار ≥ x) = rtp/(100·x) فيكون العائد المتوقع rtp% عند أي مضاعف سحب (الباقي ميزة معلنة للمنصة). أقصى مضاعف 22×. */
+const CRASH_GROW = 0.085, CRASH_SHOW_MS = 3200, CRASH_CAP = 22;
+const CRASH_STATUS = ['active', 'cashed', 'lost'];
+const crashMsOf = (cp) => Math.round(Math.log(Math.min(CRASH_CAP, Math.max(1, cp))) / CRASH_GROW * 1000);
+const crashMult = (r, t) => Math.min(CRASH_CAP, Math.floor(Math.exp(r.grow * Math.max(0, t - r.flightAt) / 1000) * 100) / 100);
+function genCrashPoint(rtp) {
+  const x = crypto.randomInt(0, 2 ** 32) / 2 ** 32; // [0,1)
+  return Math.min(CRASH_CAP, Math.max(1, Math.floor(rtp / (1 - x)) / 100));
+}
+const crashPhase = (r, t) => (t < r.flightAt ? 'wait' : t < r.endAt && crashMult(r, t) < r.crashPoint ? 'fly' : 'crash');
+const maskName = (u) => `${String(u.first_name || u.id).replace(/\s+/g, '').slice(0, 2)}*****`;
+
+/** يصرف ربح رهان (حجز ذرّي ثم إضافة للرصيد). يعيد الربح أو null إن سبقه أحد */
+async function crashPay(b, mult) {
+  const win = r2(b.amount * mult);
+  const claim = await crashBets.findOneAndUpdate({ _id: b._id, status: 'active' }, { $set: { status: 'cashed', mult, win } });
+  if (!claim) return null;
+  try { await credit({ _id: b.uid }, 'crash_win', win, { ref: `ربح الصاروخ ${mult.toFixed(2)}x` }, { earn: false }); }
+  catch (e) { await crashBets.updateOne({ _id: b._id }, { $set: { status: 'active' }, $unset: { mult: '', win: '' } }).catch(() => {}); throw e; }
+  return win;
+}
+
+/** يسوّي كل رهانات جولة انتهت: السحب التلقائي الذي سبق الانهيار يُصرف، والباقي يخسر */
+async function crashSettle(r) {
+  if (r.settled) return;
+  let ok = true;
+  for (const b of await crashBets.find({ round: r._id, status: 'active' }).toArray()) {
+    try {
+      if (b.autoAt >= 1.01 && b.autoAt < r.crashPoint) await crashPay(b, b.autoAt);
+      else await crashBets.updateOne({ _id: b._id, status: 'active' }, { $set: { status: 'lost', mult: 0, win: 0 } });
+    } catch (e) { ok = false; console.error('crash settle:', e.message); }
+  }
+  if (ok) await crashC.updateOne({ _id: r._id }, { $set: { settled: true } });
+}
+
+/** يصرف أثناء الطيران أي سحب تلقائي بلغه المضاعف الحالي */
+async function crashAutoCash(r, m) {
+  for (const b of await crashBets.find({ round: r._id, status: 'active', autoAt: { $gte: 1.01, $lte: m } }).toArray()) {
+    try { await crashPay(b, b.autoAt); } catch (e) { console.error('crash auto:', e.message); }
+  }
+}
+
+/** الجولة الحالية (تُسوّى القديمة وتُنشأ التالية عند الحاجة). create=false عند تعطيل اللعبة */
+async function crashCurrent(create = true) {
+  const c = (await RAW()).crash, now = Date.now();
+  const latest = () => crashC.find().sort({ _id: -1 }).limit(1).next();
+  let r = await latest();
+  if (r && !r.settled && now >= r.endAt) { await crashSettle(r); r = await latest(); }
+  if (create && c.enabled !== false && (!r || (r.settled && now >= r.endAt + CRASH_SHOW_MS))) {
+    const waitMs = Math.round(c.waitSec * 1000), cp = genCrashPoint(c.rtp);
+    const doc = { _id: r ? r._id + 1 : 1, at: now, waitMs, flightAt: now + waitMs, grow: CRASH_GROW, crashPoint: cp, endAt: now + waitMs + crashMsOf(cp), settled: false };
+    try { await crashC.insertOne(doc); r = doc; } catch (e) { if (e.code !== 11000) throw e; r = await latest(); } // طلب آخر أنشأها قبلنا
+  }
+  return r;
+}
+
+const crashSlot = (b) => { const s = Number(b.slot); if (s !== 0 && s !== 1) fail('bad_value'); return s; };
+const crashBetId = (r, u, slot) => `${r._id}:${u.id}:${slot}`;
+
+U.get('/crash/state', limiter('crashstate', 300, 60000, (req) => req.u.id), wrap(async (req) => {
+  const u = req.u, c = (await RAW()).crash, now = Date.now();
+  const r = await crashCurrent(c.enabled !== false);
+  if (c.enabled === false || !r) return { enabled: false, now };
+  const phase = crashPhase(r, now);
+  if (phase === 'fly') await crashAutoCash(r, crashMult(r, now));
+  const q = { round: r._id, status: { $in: CRASH_STATUS } };
+  const [all, mine, hist, me] = await Promise.all([
+    crashBets.find(q).sort({ amount: -1 }).limit(60).toArray(),
+    crashBets.find({ ...q, uid: u.id }).toArray(),
+    crashC.find({ settled: true }).sort({ _id: -1 }).limit(30).project({ crashPoint: 1 }).toArray(),
+    getUser(u.id),
+  ]);
+  const round = { id: r._id, phase, flightAt: r.flightAt, waitMs: r.waitMs, grow: r.grow, nextAt: r.endAt + CRASH_SHOW_MS };
+  if (phase === 'crash') round.crashPoint = r.crashPoint; // لا تُكشف قبل الانهيار أبدًا
+  const row = (b) => ({ slot: b.slot, amount: b.amount, status: b.status, mult: b.status === 'cashed' ? b.mult : 0, win: b.status === 'cashed' ? b.win : 0, autoAt: b.autoAt || 0 });
+  return {
+    enabled: true, now, round, balance: r2(me ? me.balance : u.balance), hist: hist.map((x) => x.crashPoint),
+    mine: mine.map(row),
+    players: all.map((b) => ({ me: b.uid === u.id, name: b.uid === u.id ? `أنت #${b.slot + 1}` : b.name, bet: b.amount, status: b.status, mult: b.status === 'cashed' ? b.mult : 0, win: b.status === 'cashed' ? b.win : 0 })),
+  };
+}));
+
+U.post('/crash/bet', limiter('crashbet', 60, 60000, (req) => req.u.id), wrap(async (req) => {
+  const u = req.u, b = req.body || {}, c = (await RAW()).crash;
+  if (c.enabled === false) fail('crash_disabled', 403);
+  const slot = crashSlot(b), amount = r2(Number(b.amount));
+  if (!(amount > 0)) fail('bad_value');
+  if (amount < c.minBet) fail('below_min', 400, { min: c.minBet });
+  if (amount > c.maxBet) fail('above_max', 400, { max: c.maxBet });
+  let autoAt = Number(b.autoAt) || 0; autoAt = autoAt >= 1.01 ? Math.min(CRASH_CAP, r2(autoAt)) : 0;
+  const r = await crashCurrent();
+  if (!r || Date.now() >= r.flightAt) fail('round_started', 409); // الرهان قبل الإقلاع فقط
+  const id = crashBetId(r, u, slot);
+  try { await crashBets.insertOne({ _id: id, round: r._id, uid: u.id, slot, name: maskName(u), amount, autoAt, status: 'hold', at: Date.now() }); }
+  catch (e) { if (e.code === 11000) fail('already_bet', 409); throw e; }
+  const nu = await credit({ _id: u.id, balance: { $gte: amount } }, 'crash_bet', -amount, { ref: 'رهان الصاروخ' }, { earn: false });
+  if (!nu) { await crashBets.deleteOne({ _id: id }); fail('insufficient', 402); }
+  if (Date.now() >= r.flightAt) { // بدأت الجولة أثناء المعالجة: يُسترجع الرهان
+    await crashBets.deleteOne({ _id: id });
+    await credit({ _id: u.id }, 'crash_win', amount, { ref: 'استرجاع رهان الصاروخ' }, { earn: false });
+    fail('round_started', 409);
+  }
+  await crashBets.updateOne({ _id: id }, { $set: { status: 'active' } });
+  return { balance: r2(nu.balance), bet: { slot, amount, status: 'active', mult: 0, win: 0, autoAt } };
+}));
+
+U.post('/crash/cancel', limiter('crashcancel', 60, 60000, (req) => req.u.id), wrap(async (req) => {
+  const u = req.u, slot = crashSlot(req.body || {});
+  const r = await crashCurrent(false);
+  if (!r || Date.now() >= r.flightAt) fail('round_started', 409);
+  const d = await crashBets.findOneAndDelete({ _id: crashBetId(r, u, slot), status: 'active' });
+  if (!d) fail('not_found', 404);
+  const nu = await credit({ _id: u.id }, 'crash_win', d.amount, { ref: 'إلغاء رهان الصاروخ' }, { earn: false });
+  return { balance: r2(nu ? nu.balance : u.balance) };
+}));
+
+U.post('/crash/cashout', limiter('crashcash', 120, 60000, (req) => req.u.id), wrap(async (req) => {
+  const u = req.u, slot = crashSlot(req.body || {});
+  const r = await crashCurrent(false), now = Date.now();
+  if (!r) fail('not_found', 404);
+  const bet = await crashBets.findOne({ _id: crashBetId(r, u, slot) });
+  if (!bet || bet.status === 'hold') fail('not_found', 404);
+  const balance = async () => r2((await getUser(u.id) || u).balance);
+  if (bet.status === 'cashed') return { crashed: false, already: true, mult: bet.mult, win: bet.win, balance: await balance() };
+  if (now < r.flightAt) fail('round_wait', 409);
+  const m = crashMult(r, now);
+  if (crashPhase(r, now) === 'crash') { // انهار قبل وصول الطلب
+    await crashSettle(r);
+    return { crashed: true, crashPoint: r.crashPoint, balance: await balance() };
+  }
+  const win = await crashPay(bet, m);
+  if (win === null) { const cur = await crashBets.findOne({ _id: bet._id }); return { crashed: false, already: true, mult: cur ? cur.mult : m, win: cur ? cur.win : 0, balance: await balance() }; }
+  return { crashed: false, mult: m, win, balance: await balance() };
+}));
+
 /* ═══════════════ الإدارة: POST /api/admin/:action ═══════════════ */
 const signAdmin = (exp) => `${exp}.${crypto.createHmac('sha256', ADMIN_SECRET).update(String(exp)).digest('hex')}`;
 const checkAdmin = (tok) => { const [exp, sig] = String(tok || '').split('.'); return !!exp && !!sig && Number(exp) > Date.now() && safeEq(signAdmin(exp), `${exp}.${sig}`); };
@@ -811,6 +987,7 @@ const ADMIN = {
     const s = { ...b.settings }; delete s.demo; delete s._id;
     for (const k of Object.keys(s)) if (k.startsWith('$') || k.includes('.')) delete s[k];
     if (s.ads !== undefined) s.ads = sanitizeAds(s.ads, (await RAW()).ads); // أرقام آمنة فقط (مكافأة/مؤقت/مدة/حد يومي)
+    if (s.crash !== undefined) s.crash = sanitizeCrash(s.crash, (await RAW()).crash); // قواعد لعبة الصاروخ ضمن حدود آمنة
     if (Object.keys(s).length) await settingsC.updateOne({ _id: 'main' }, { $set: s }, { upsert: true });
     cfgCache = { at: 0, v: null };
     return { settings: await RAW() };
@@ -857,7 +1034,7 @@ const ADMIN = {
   // إعادة ضبط كل البيانات (تجريبي — معطّل افتراضيًا لأنه يمسح قاعدة البيانات بالكامل)
   reset: async () => {
     if (!DEMO_TOOLS) fail('not_found', 404);
-    await Promise.all([users, tasksC, promos, settingsC, metaC].map((c) => c.deleteMany({})));
+    await Promise.all([users, tasksC, promos, settingsC, metaC, crashC, crashBets].map((c) => c.deleteMany({})));
     cfgCache = { at: 0, v: null };
     await seedTasks();
     return { ok: true };
