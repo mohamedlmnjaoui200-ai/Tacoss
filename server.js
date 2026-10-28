@@ -284,7 +284,7 @@ async function profileOf(u) {
 const publicTask = (t, u) => {
   const { verifyChat, verifyMembership, verifySeconds, _id, ord, ...pub } = t; // eslint-disable-line no-unused-vars
   const st = (u.taskState || {})[t.id] || {};
-  return { ...pub, status: st.status || 'available', verifyAt: st.verifyAt || 0 };
+  return { ...pub, status: st.status || 'available', verifyAt: st.verifyAt || 0, opened: !!st.openedAt };
 };
 
 /* ───────────── التسجيل والإحالة (مشترك بين التطبيق والبوت) ─────────────
@@ -549,6 +549,23 @@ U.post('/tasks/start', wrap(async (req) => {
   return { task: publicTask(t, { taskState: { [id]: st } }), url: t.url };
 }));
 
+// POST /api/tasks/opened {id} — مهمة القصة: يسجّل الخادم لحظة فتح المستخدم محرر القصص، ومنها يبدأ عدّاد الانتظار (verifySeconds، الافتراضي 60 ثانية).
+// لا يمكن استلام مهمة القصة قبل هذا الاستدعاء. (لا يثبت النشر الفعلي: تيليجرام لا يتيح ذلك — يمنع الاستلام العشوائي فقط)
+U.post('/tasks/opened', wrap(async (req) => {
+  const u = req.u, id = String(req.body?.id || '');
+  if (!ID_RE.test(id)) fail('not_found', 404);
+  const t = await tasksC.findOne({ _id: id, active: { $ne: false } });
+  if (!t || t.check !== 'story') fail('not_found', 404);
+  if ((u.taskState || {})[id]?.status === 'done') fail('task_done', 409);
+  const p = `taskState.${id}`, now = Date.now();
+  await users.updateOne(
+    { _id: u.id, [`${p}.openedAt`]: { $exists: false }, $or: [{ [`${p}.status`]: { $exists: false } }, { [`${p}.status`]: 'started' }] },
+    { $set: { [`${p}.status`]: 'started', [`${p}.openedAt`]: now, [`${p}.verifyAt`]: now + (Number(t.verifySeconds) || 60) * 1000 } },
+  );
+  const nu = await getUser(u.id);
+  return { task: publicTask(t, nu) };
+}));
+
 /* التحقق الفعلي من مهام تيليجرام (انضمام لقناة/مجموعة): لا مكافأة إن لم يكن المستخدم عضوًا فعلًا.
    الهدف يُحدَّد بـ task.verifyChat (مثل @channel أو -100123…) أو يُستنتج تلقائيًا من رابط t.me/<اسم> العام.
    لإيقاف التحقق التلقائي لمهمة معيّنة اجعل verifyMembership=false. شرط العمل: البوت مشرف في القناة/المجموعة. */
@@ -615,6 +632,7 @@ U.post('/tasks/claim', wrap(async (req) => {
   const p = `taskState.${id}`, st = (u.taskState || {})[id];
   if (st?.status === 'done') fail('task_done', 409);
   if (!st) fail('task_pending', 409);
+  if (t.check === 'story' && !st.openedAt) fail('story_not_opened', 409, { message: 'افتح محرر القصة أولًا' });
   if (Date.now() < st.verifyAt) fail('task_pending', 409, { wait: Math.ceil((st.verifyAt - Date.now()) / 1000) });
   const kind = CHECKS.includes(t.check) ? t.check : '';
   const vChat = kind ? '' : verifyTarget(t);
@@ -1063,6 +1081,7 @@ const ADMIN = {
     delete t._id; delete t.ord; delete t.status; delete t.verifyAt;
     // نوع التحقق الاختياري للمهمة: bio | name | story (فارغ = المهمة العادية)
     t.check = CHECKS.includes(t.check) ? t.check : '';
+    t.verifySeconds = Math.min(3600, Math.max(0, Math.round(Number(t.verifySeconds) || 0))); // 0 = الافتراضي (10 ث للعادية، 60 ث للقصة)
     t.checkText = String(t.checkText || '').trim().slice(0, 60);
     t.storyImage = String(t.storyImage || '').trim().slice(0, 500);
     if (t.check === 'story' && !/^https:\/\//i.test(t.storyImage)) fail('bad_value'); // shareToStory يتطلب رابط https للصورة
