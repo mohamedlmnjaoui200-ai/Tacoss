@@ -52,7 +52,7 @@
      POST /api/crash/cancel           {slot}                        يلغي الرهان ويعيد المبلغ (قبل الإقلاع فقط)
      POST /api/crash/cashout          {slot}                        يسحب عند المضاعف الحالي المحسوب على الخادم
    الإدارة (POST /api/admin/:action — ترويسة x-admin-token ما عدا login)
-     login · stats · users · user · balance · ban · delete · webhook
+     login · stats · online (النشطون الآن) · users · user · balance · ban · delete · webhook
      withdrawals · withdrawal · settings · saveSettings (تشمل ads و crash — لعبة الصاروخ)
      tasks · saveTask · deleteTask · promos · savePromo · deletePromo
      simInvite · reset   (تجريبيان — يعملان فقط مع ADMIN_DEMO_TOOLS=1)
@@ -175,7 +175,7 @@ async function connect() {
   crashC = db.collection('crashRounds'); crashBets = db.collection('crashBets');
   await Promise.all([
     users.createIndex({ invitedBy: 1 }), users.createIndex({ totalEarned: -1 }), users.createIndex({ joinedAt: -1 }),
-    users.createIndex({ 'withdrawals.id': 1 }), promos.createIndex({ createdAt: -1 }),
+    users.createIndex({ 'withdrawals.id': 1 }), promos.createIndex({ createdAt: -1 }), users.createIndex({ lastSeen: -1 }), users.createIndex({ crashSeen: -1 }),
     crashBets.createIndex({ round: 1, status: 1 }), crashBets.createIndex({ round: 1, uid: 1 }),
     crashBets.createIndex({ at: 1 }, { expireAfterSeconds: 7 * 86400 }), crashC.createIndex({ at: 1 }, { expireAfterSeconds: 7 * 86400 }),
   ]);
@@ -570,6 +570,42 @@ async function isChatMember(chat, userId) {
   } catch (e) { console.warn('[verify]', e.message); return false; }
 }
 
+/* مهام الملف الشخصي (تُختار لكل مهمة من لوحة الأدمن عبر الحقل task.check):
+   • bio   : رابط إحالة المستخدم نفسه (ref_<id> + اسم البوت) موجود في سيرته على تيليجرام — يُتحقق منه فعليًا عبر getChat.
+   • name  : الاسم الشخصي على تيليجرام يحتوي 💡 ونص task.checkText (افتراضيًا اسم التطبيق) — يُتحقق منه فعليًا عبر getChat.
+   • story : نشر قصة بصورة task.storyImage ورابط الإحالة. تيليجرام لا يتيح للبوتات قراءة القصص، فلا يمكن التحقق منها آليًا؛
+             المهمة تعتمد على مدة الانتظار verifySeconds فقط (الأفضل رفع مكافأتها قليلًا أو جعلها أقل قيمة من مهمتي البيو والاسم).
+   شرط التحقق: أن يكون المستخدم قد فتح البوت (Start) مرة على الأقل، وإلا يرفض تيليجرام getChat. */
+const CHECKS = ['bio', 'name', 'story'];
+async function profileInfo(userId) {
+  if (!BOT_TOKEN) return null;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getChat?chat_id=${userId}`, { signal: AbortSignal.timeout(8000) });
+    const j = await r.json();
+    if (!j.ok) { console.warn(`[verify] getChat ${userId}: ${j.description || 'error'}`); return null; }
+    return j.result || null;
+  } catch (e) { console.warn('[verify]', e.message); return null; }
+}
+/** يعيد null عند النجاح أو رمز الخطأ: need_start | bio_missing | name_missing */
+async function checkProfile(kind, t, u, c) {
+  if (kind === 'story') return null;
+  const info = await profileInfo(u.id);
+  if (!info) return 'need_start';
+  const bot = String(c.botUsername || '').replace(/^@/, '').toLowerCase();
+  if (kind === 'bio') {
+    const bio = String(info.bio || '').toLowerCase();
+    return bio.includes(`ref_${u.id}`) && (!bot || bio.includes(bot)) ? null : 'bio_missing';
+  }
+  const full = `${info.first_name || ''} ${info.last_name || ''}`.toLowerCase();
+  const need = String(t.checkText || c.appName || '').trim().toLowerCase();
+  return full.includes('💡') && (!need || full.includes(need)) ? null : 'name_missing';
+}
+const CHECK_MSG = {
+  need_start: 'افتح البوت واضغط «Start» مرة واحدة ثم أعد المحاولة',
+  bio_missing: 'لم نجد رابط إحالتك في سيرتك (البيو). ضعه ثم اضغط استلام',
+  name_missing: 'لم نجد 💡 واسم البوت في اسمك الشخصي. أضفهما ثم اضغط استلام',
+};
+
 // POST /api/tasks/claim {id}
 U.post('/tasks/claim', wrap(async (req) => {
   const u = req.u, id = String(req.body?.id || '');
@@ -580,17 +616,21 @@ U.post('/tasks/claim', wrap(async (req) => {
   if (st?.status === 'done') fail('task_done', 409);
   if (!st) fail('task_pending', 409);
   if (Date.now() < st.verifyAt) fail('task_pending', 409, { wait: Math.ceil((st.verifyAt - Date.now()) / 1000) });
-  const vChat = verifyTarget(t);
-  if (vChat) {
+  const kind = CHECKS.includes(t.check) ? t.check : '';
+  const vChat = kind ? '' : verifyTarget(t);
+  if (vChat || kind === 'bio' || kind === 'name') {
     // قفل ضد الاستلام المزدوج أثناء انتظار تيليجرام (ينتهي تلقائيًا بعد 60 ثانية)
     const lk = await users.updateOne(
       { _id: u.id, [`${p}.status`]: 'started', $or: [{ [`${p}.claiming`]: { $exists: false } }, { [`${p}.claiming`]: { $lt: Date.now() - 60000 } }] },
       { $set: { [`${p}.claiming`]: Date.now() } },
     );
     if (!lk.matchedCount) fail('task_pending', 409);
-    let ok = false;
-    try { ok = await isChatMember(vChat, u.id); } finally { await users.updateOne({ _id: u.id }, { $unset: { [`${p}.claiming`]: '' } }); }
-    if (!ok) fail('not_joined', 409, { wait: 5, message: 'لم يتم التحقق من تنفيذ المهمة — انضم أولًا ثم اضغط استلام' });
+    let ok = false, code = '';
+    try {
+      if (kind) { code = (await checkProfile(kind, t, u, await CFG())) || ''; ok = !code; }
+      else ok = await isChatMember(vChat, u.id);
+    } finally { await users.updateOne({ _id: u.id }, { $unset: { [`${p}.claiming`]: '' } }); }
+    if (!ok) fail(code || 'not_joined', 409, { wait: 5, message: CHECK_MSG[code] || 'لم يتم التحقق من تنفيذ المهمة — انضم أولًا ثم اضغط استلام' });
   }
   const day = dayKey();
   const nu = await credit({ _id: u.id, [`${p}.status`]: 'started' }, 'task', t.reward, { ref: t.title },
@@ -809,8 +849,12 @@ async function crashCurrent(create = true) {
 const crashSlot = (b) => { const s = Number(b.slot); if (s !== 0 && s !== 1) fail('bad_value'); return s; };
 const crashBetId = (r, u, slot) => `${r._id}:${u.id}:${slot}`;
 
+// POST /api/ping — نبضة حضور من التطبيق كل 30 ثانية وهو ظاهر (auth يحدّث lastSeen مع كل طلب)؛ لا تُرجع بيانات
+U.post('/ping', limiter('ping', 10, 60000, (req) => req.u.id), wrap(async () => ({ ok: true })));
+
 U.get('/crash/state', limiter('crashstate', 300, 60000, (req) => req.u.id), wrap(async (req) => {
   const u = req.u, c = (await RAW()).crash, now = Date.now();
+  if (!(u.crashSeen > now - 10000)) await users.updateOne({ _id: u.id }, { $set: { crashSeen: now } }).catch(() => {}); // حضور اللاعب في اللعبة (للوحة الأدمن)
   const r = await crashCurrent(c.enabled !== false);
   if (c.enabled === false || !r) return { enabled: false, now };
   const phase = crashPhase(r, now);
@@ -915,6 +959,24 @@ const ADMIN = {
       activePromos: await promos.countDocuments({ active: { $ne: false } }), adsToday: a.adsToday || 0, adsPaid: r2(a.adsPaid || 0),
     } };
   },
+  /* النشطون الآن: «في التطبيق الآن» = آخر طلب موقّع خلال 90 ثانية (lastSeen يُحدَّث مع كل طلب، والتطبيق يرسل /ping كل 30 ثانية وهو ظاهر)،
+     «في الكراش» = يفتح شاشة اللعبة الآن (crashSeen خلال 30 ثانية) — مع رهانه في الجولة الأخيرة إن وُجد */
+  online: async () => {
+    const now = Date.now(), M = 60000, proj = { id: 1, first_name: 1, last_name: 1, username: 1, balance: 1, lastSeen: 1, crashSeen: 1 };
+    const [bot, crash, n5, n60, n24, last] = await Promise.all([
+      users.find({ lastSeen: { $gt: now - 90000 } }).sort({ lastSeen: -1 }).limit(100).project(proj).toArray(),
+      users.find({ crashSeen: { $gt: now - 30000 } }).sort({ crashSeen: -1 }).limit(100).project(proj).toArray(),
+      users.countDocuments({ lastSeen: { $gt: now - 90000 } }), users.countDocuments({ lastSeen: { $gt: now - 60 * M } }), users.countDocuments({ lastSeen: { $gt: now - 24 * 60 * M } }),
+      crashC.find({}).sort({ _id: -1 }).limit(1).toArray(),
+    ]);
+    const bets = last[0] ? await crashBets.find({ round: last[0]._id, status: { $in: CRASH_STATUS } }).toArray() : [];
+    const staked = new Map(); bets.forEach((b) => staked.set(b.uid, r2((staked.get(b.uid) || 0) + b.amount)));
+    const row = (x) => ({ id: x.id ?? x._id, name: fullName(x), username: x.username || '', balance: r2(x.balance || 0), lastSeen: x.lastSeen || 0, crashSeen: x.crashSeen || 0, bet: staked.get(x.id ?? x._id) || 0 });
+    return {
+      counts: { bot5: n5, bot60: n60, bot24: n24, crash: crash.length, crashBettors: staked.size, crashStaked: r2([...staked.values()].reduce((a, v) => a + v, 0)) },
+      bot: bot.map(row), crash: crash.map(row),
+    };
+  },
   users: async (b) => {
     const q = String(b.q || '').trim();
     const and = [];
@@ -999,7 +1061,12 @@ const ADMIN = {
     if (!t.id) t.id = `t${Date.now().toString(36)}`;
     t.id = String(t.id); if (!ID_RE.test(t.id)) fail('bad_value');
     delete t._id; delete t.ord; delete t.status; delete t.verifyAt;
-    const old = await tasksC.findOne({ _id: t.id }, { projection: { ord: 1 } });
+    // نوع التحقق الاختياري للمهمة: bio | name | story (فارغ = المهمة العادية)
+    t.check = CHECKS.includes(t.check) ? t.check : '';
+    t.checkText = String(t.checkText || '').trim().slice(0, 60);
+    t.storyImage = String(t.storyImage || '').trim().slice(0, 500);
+    if (t.check === 'story' && !/^https:\/\//i.test(t.storyImage)) fail('bad_value'); // shareToStory يتطلب رابط https للصورة
+    const old =await tasksC.findOne({ _id: t.id }, { projection: { ord: 1 } });
     await tasksC.replaceOne({ _id: t.id }, { _id: t.id, ...t, ord: old ? old.ord : Date.now() }, { upsert: true });
     return { tasks: await listTasks() };
   },
