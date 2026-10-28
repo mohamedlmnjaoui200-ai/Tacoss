@@ -51,9 +51,13 @@
      POST /api/crash/bet              {slot:0|1, amount, autoAt?}   يخصم الرهان فورًا (قبل الإقلاع فقط)
      POST /api/crash/cancel           {slot}                        يلغي الرهان ويعيد المبلغ (قبل الإقلاع فقط)
      POST /api/crash/cashout          {slot}                        يسحب عند المضاعف الحالي المحسوب على الخادم
+     GET  /api/treasure/state         لعبة الكنز: القواعد + لعبتي الجارية (إن وُجدت) + جدول المضاعفات + رصيدي + السجل
+     POST /api/treasure/start         {amount}  يخصم الرهان ويختار الخادم موضع القنبلة سرًّا (crypto.randomInt)
+     POST /api/treasure/pick          {index 0..8}  يفتح خريطة: آمنة ← يرتفع المضاعف، القنبلة ← خسارة (تُكشف القنبلة بعد انتهاء الجولة فقط)
+     POST /api/treasure/cashout       يسحب عند المضاعف الحالي (بعد خريطة آمنة واحدة على الأقل)
    الإدارة (POST /api/admin/:action — ترويسة x-admin-token ما عدا login)
      login · stats · online (النشطون الآن) · users · user · balance · ban · delete · webhook
-     withdrawals · withdrawal · settings · saveSettings (تشمل ads و crash — لعبة الصاروخ)
+     withdrawals · withdrawal · settings · saveSettings (تشمل ads و crash — لعبة الصاروخ و treasure — لعبة الكنز)
      tasks · saveTask · deleteTask · promos · savePromo · deletePromo
      simInvite · reset   (تجريبيان — يعملان فقط مع ADMIN_DEMO_TOOLS=1)
    ════════════════════════════════════════════════════════════════════════ */
@@ -118,6 +122,9 @@ const DEFAULT_CONFIG = {
   // crash: لعبة الصاروخ التجريبية — enabled = إظهار زر اللعبة · startBalance = الرصيد التجريبي الابتدائي · minBet/maxBet = حدود الرهان · waitSec = الانتظار بين الجولات (ثانية) · rtp = نسبة العائد للاعب %
   //        الحد الأقصى للمضاعف ثابت 22× (CRASH_CAP) · الرهان من 0.3 إلى 1000 · rtp=88 يعني ميزة معلنة للمنصة 12% على كل الرهانات
   crash: { enabled: true, startBalance: 1000, minBet: 0.3, maxBet: 1000, waitSec: 5, rtp: 88 },
+  // treasure: لعبة كنز الخريطة (9 خرائط، قنبلة واحدة) — نفس مبدأ الكراش: النتيجة تُحسم على الخادم بعشوائية آمنة والعائد النظري للاعب rtp% معلن للجميع
+  //           المضاعف بعد k خريطة آمنة = (rtp/100) × 9/(9−k) فيكون العائد المتوقع rtp% عند أي لحظة سحب (أقصى مضاعف = 9 × rtp/100)
+  treasure: { enabled: true, minBet: 0.3, maxBet: 1000, rtp: 90 },
   botUsername: 'Moneyslayer1_bot',
   miniAppName: 'app',
   channel: '',
@@ -157,7 +164,7 @@ const fail = (code, status = 400, extra = {}) => { throw new AppError(code, stat
    المجموعات: users (_id = معرّف تيليجرام) · tasks · promos (_id = الكود) · settings · meta
    كل تعديل على الرصيد يتم بتحديث ذرّي واحد (pipeline update) مع شرط في الفلتر،
    فلا يمكن لطلبين متزامنين خصم نفس الرصيد مرتين أو استلام نفس المكافأة مرتين. */
-let users, tasksC, promos, settingsC, metaC, crashC, crashBets;
+let users, tasksC, promos, settingsC, metaC, crashC, crashBets, treasureC;
 
 async function seedTasks() {
   const first = await metaC.updateOne({ _id: 'seeded' }, { $setOnInsert: { at: Date.now() } }, { upsert: true });
@@ -172,11 +179,13 @@ async function connect() {
   const db = client.db(MONGODB_DB);
   users = db.collection('users'); tasksC = db.collection('tasks'); promos = db.collection('promos');
   settingsC = db.collection('settings'); metaC = db.collection('meta');
-  crashC = db.collection('crashRounds'); crashBets = db.collection('crashBets');
+  crashC = db.collection('crashRounds'); crashBets = db.collection('crashBets'); treasureC = db.collection('treasureGames');
   await Promise.all([
     users.createIndex({ invitedBy: 1 }), users.createIndex({ totalEarned: -1 }), users.createIndex({ joinedAt: -1 }),
     users.createIndex({ 'withdrawals.id': 1 }), promos.createIndex({ createdAt: -1 }), users.createIndex({ lastSeen: -1 }), users.createIndex({ crashSeen: -1 }),
     crashBets.createIndex({ round: 1, status: 1 }), crashBets.createIndex({ round: 1, uid: 1 }),
+    treasureC.createIndex({ uid: 1 }, { unique: true, partialFilterExpression: { act: 1 } }), // لعبة جارية واحدة فقط لكل مستخدم
+    treasureC.createIndex({ uid: 1, at: -1 }), treasureC.createIndex({ doneAt: 1 }, { expireAfterSeconds: 30 * 86400 }),
     crashBets.createIndex({ at: 1 }, { expireAfterSeconds: 7 * 86400 }), crashC.createIndex({ at: 1 }, { expireAfterSeconds: 7 * 86400 }),
   ]);
   await seedTasks();
@@ -226,12 +235,31 @@ function sanitizeCrash(inp, cur) {
   return out;
 }
 
+/** تنظيف إعدادات لعبة الكنز (نفس حدود الكراش) */
+function sanitizeTreasure(inp, cur) {
+  if (!inp || typeof inp !== 'object') fail('bad_value');
+  const num = (v, old, min, max, dec = 2) => {
+    if (v === undefined || v === null || v === '') return old;
+    const n = Number(v); if (!Number.isFinite(n) || n < min || n > max) fail('bad_value');
+    return Math.round(n * 10 ** dec) / 10 ** dec;
+  };
+  const c = { ...DEFAULT_CONFIG.treasure, ...(cur || {}) };
+  const out = {
+    enabled: inp.enabled === undefined ? c.enabled !== false : !!inp.enabled,
+    minBet: num(inp.minBet, c.minBet, 0.01, 1e7),
+    maxBet: num(inp.maxBet, c.maxBet, 0.01, 1e7),
+    rtp: num(inp.rtp, c.rtp, 50, 99.9, 1),
+  };
+  if (out.maxBet < out.minBet) fail('bad_value');
+  return out;
+}
+
 /* الإعدادات (تُخزَّن في settings/main وتُدمج مع الافتراضية، مع ذاكرة مؤقتة قصيرة) */
 let cfgCache = { at: 0, v: null };
 async function RAW() {
   if (cfgCache.v && Date.now() - cfgCache.at < 2000) return cfgCache.v;
   const d = (await settingsC.findOne({ _id: 'main' })) || {}; delete d._id;
-  const v = { ...DEFAULT_CONFIG, ...d, ads: { ...DEFAULT_CONFIG.ads, ...(d.ads || {}) }, crash: { ...DEFAULT_CONFIG.crash, ...(d.crash || {}) } };
+  const v = { ...DEFAULT_CONFIG, ...d, ads: { ...DEFAULT_CONFIG.ads, ...(d.ads || {}) }, crash: { ...DEFAULT_CONFIG.crash, ...(d.crash || {}) }, treasure: { ...DEFAULT_CONFIG.treasure, ...(d.treasure || {}) } };
   cfgCache = { at: Date.now(), v };
   return v;
 }
@@ -947,6 +975,99 @@ U.post('/crash/cashout', limiter('crashcash', 120, 60000, (req) => req.u.id), wr
   return { crashed: false, mult: m, win, balance: await balance() };
 }));
 
+/* ═══════════════ لعبة الكنز (بالرصيد الحقيقي) ═══════════════
+   نفس مبدأ الكراش: الخادم هو الحَكَم الوحيد؛ موضع القنبلة يُختار عند بدء اللعبة بـ crypto.randomInt ويبقى سريًا حتى تنتهي الجولة،
+   لا يتأثر بالرصيد أو بسجل اللاعب. العائد النظري = rtp% (معلن): المضاعف بعد k خريطة آمنة = rtp/100 × 9/(9−k).
+   الرهان يُخصم ذريًا عند البدء، والربح يُضاف ذريًا عند السحب (حجز الحالة أولًا ثم الإضافة، مع تراجع عند الفشل). لعبة جارية واحدة لكل مستخدم. */
+const T_CELLS = 9;
+const floor2 = (x) => Math.floor(x * 100 + 1e-9) / 100;
+const treasureMult = (rtp, k) => (k <= 0 ? 1 : floor2((rtp / 100) * T_CELLS / (T_CELLS - k)));
+const treasureMults = (rtp) => Array.from({ length: T_CELLS }, (_, k) => treasureMult(rtp, k)); // k = 0..8
+const treasurePub = (g) => {
+  const k = g.picked.length;
+  return { bet: g.bet, picked: g.picked, safe: k, mult: treasureMult(g.rtp, k), next: k < T_CELLS - 1 ? treasureMult(g.rtp, k + 1) : 0 };
+};
+const balanceOf = async (id) => { const x = await getUser(id); return r2(x ? x.balance : 0); };
+
+/** يصرف ربح لعبة جارية (حجز ذرّي ثم إضافة للرصيد). يعيد {win,mult,picked,bomb} أو null إن سبقه أحد */
+async function treasurePay(g) {
+  const claim = await treasureC.findOneAndUpdate({ _id: g._id, status: 'active', 'picked.0': { $exists: true } }, { $set: { status: 'cashed', doneAt: new Date() }, $unset: { act: '' } });
+  if (!claim) return null;
+  const k = claim.picked.length, mult = treasureMult(claim.rtp, k), win = floor2(claim.bet * mult);
+  await treasureC.updateOne({ _id: claim._id }, { $set: { mult, win } });
+  try { await credit({ _id: claim.uid }, 'treasure_win', win, { ref: `ربح الكنز ${mult.toFixed(2)}x` }, { earn: false }); }
+  catch (e) { await treasureC.updateOne({ _id: claim._id }, { $set: { status: 'active', act: 1 }, $unset: { mult: '', win: '', doneAt: '' } }).catch(() => {}); throw e; }
+  return { win, mult, picked: claim.picked, bomb: claim.bomb };
+}
+
+U.get('/treasure/state', limiter('tstate', 120, 60000, (req) => req.u.id), wrap(async (req) => {
+  const u = req.u, c = (await RAW()).treasure;
+  const [g, hist, me] = await Promise.all([
+    treasureC.findOne({ uid: u.id, status: 'active' }),
+    treasureC.find({ uid: u.id, status: { $in: ['cashed', 'lost'] } }).sort({ at: -1 }).limit(12).project({ status: 1 }).toArray(),
+    getUser(u.id),
+  ]);
+  return {
+    enabled: c.enabled !== false, rules: { minBet: c.minBet, maxBet: c.maxBet, rtp: g ? g.rtp : c.rtp }, mults: treasureMults(g ? g.rtp : c.rtp),
+    balance: r2(me ? me.balance : u.balance), game: g ? treasurePub(g) : null, hist: hist.map((x) => x.status === 'cashed'),
+  };
+}));
+
+U.post('/treasure/start', limiter('tstart', 60, 60000, (req) => req.u.id), wrap(async (req) => {
+  const u = req.u, c = (await RAW()).treasure, amount = r2(Number(req.body?.amount));
+  if (c.enabled === false) fail('treasure_disabled', 403);
+  if (!(amount > 0)) fail('bad_value');
+  if (amount < c.minBet) fail('below_min', 400, { min: c.minBet });
+  if (amount > c.maxBet) fail('above_max', 400, { max: c.maxBet });
+  const id = `${u.id}:${Date.now()}:${crypto.randomBytes(4).toString('hex')}`;
+  const doc = { _id: id, uid: u.id, bet: amount, rtp: c.rtp, bomb: crypto.randomInt(0, T_CELLS), picked: [], status: 'hold', act: 1, at: Date.now() };
+  for (let i = 0; i < 2; i++) {
+    try { await treasureC.insertOne(doc); break; }
+    catch (e) {
+      if (e.code !== 11000) throw e;
+      const ex = await treasureC.findOne({ uid: u.id, act: 1 });
+      if (ex && ex.status === 'hold' && Date.now() - ex.at > 60000 && !i) { await treasureC.deleteOne({ _id: ex._id, status: 'hold' }); continue; } // بقايا قديمة لم يُخصم لها رهان
+      fail('game_active', 409);
+    }
+  }
+  const nu = await credit({ _id: u.id, balance: { $gte: amount } }, 'treasure_bet', -amount, { ref: 'رهان الكنز' }, { earn: false });
+  if (!nu) { await treasureC.deleteOne({ _id: id }); fail('insufficient', 402); }
+  await treasureC.updateOne({ _id: id }, { $set: { status: 'active' } });
+  return { balance: r2(nu.balance), mults: treasureMults(c.rtp), game: treasurePub(doc) };
+}));
+
+U.post('/treasure/pick', limiter('tpick', 240, 60000, (req) => req.u.id), wrap(async (req) => {
+  const u = req.u, idx = Number(req.body?.index);
+  if (!Number.isInteger(idx) || idx < 0 || idx >= T_CELLS) fail('bad_value');
+  const g = await treasureC.findOne({ uid: u.id, status: 'active' });
+  if (!g) fail('no_game', 404);
+  if (g.picked.includes(idx)) fail('bad_value');
+  if (idx === g.bomb) { // القنبلة: خسارة الرهان (الذي خُصم عند البدء)
+    const done = await treasureC.findOneAndUpdate({ _id: g._id, status: 'active' }, { $set: { status: 'lost', doneAt: new Date() }, $unset: { act: '' } });
+    if (!done) fail('conflict', 409);
+    return { lost: true, bomb: g.bomb, picked: g.picked, balance: await balanceOf(u.id) };
+  }
+  const upd = await treasureC.findOneAndUpdate(
+    { _id: g._id, status: 'active', picked: { $ne: idx }, [`picked.${T_CELLS - 2}`]: { $exists: false } },
+    { $push: { picked: idx } }, { returnDocument: 'after' });
+  if (!upd) fail('conflict', 409);
+  if (upd.picked.length >= T_CELLS - 1) { // فتح كل الخرائط الآمنة: سحب تلقائي بأعلى مضاعف
+    const r = await treasurePay(upd);
+    if (r) return { cashed: true, auto: true, win: r.win, mult: r.mult, picked: r.picked, bomb: r.bomb, balance: await balanceOf(u.id) };
+  }
+  return { lost: false, game: treasurePub(upd) };
+}));
+
+U.post('/treasure/cashout', limiter('tcash', 120, 60000, (req) => req.u.id), wrap(async (req) => {
+  const u = req.u;
+  const g = await treasureC.findOne({ uid: u.id, status: 'active' });
+  if (!g) fail('no_game', 404);
+  if (!g.picked.length) fail('no_pick', 409);
+  const r = await treasurePay(g);
+  if (!r) fail('conflict', 409);
+  return { cashed: true, win: r.win, mult: r.mult, picked: r.picked, bomb: r.bomb, balance: await balanceOf(u.id) };
+}));
+
 /* ═══════════════ الإدارة: POST /api/admin/:action ═══════════════ */
 const signAdmin = (exp) => `${exp}.${crypto.createHmac('sha256', ADMIN_SECRET).update(String(exp)).digest('hex')}`;
 const checkAdmin = (tok) => { const [exp, sig] = String(tok || '').split('.'); return !!exp && !!sig && Number(exp) > Date.now() && safeEq(signAdmin(exp), `${exp}.${sig}`); };
@@ -1068,6 +1189,7 @@ const ADMIN = {
     for (const k of Object.keys(s)) if (k.startsWith('$') || k.includes('.')) delete s[k];
     if (s.ads !== undefined) s.ads = sanitizeAds(s.ads, (await RAW()).ads); // أرقام آمنة فقط (مكافأة/مؤقت/مدة/حد يومي)
     if (s.crash !== undefined) s.crash = sanitizeCrash(s.crash, (await RAW()).crash); // قواعد لعبة الصاروخ ضمن حدود آمنة
+    if (s.treasure !== undefined) s.treasure = sanitizeTreasure(s.treasure, (await RAW()).treasure); // قواعد لعبة الكنز
     if (Object.keys(s).length) await settingsC.updateOne({ _id: 'main' }, { $set: s }, { upsert: true });
     cfgCache = { at: 0, v: null };
     return { settings: await RAW() };
