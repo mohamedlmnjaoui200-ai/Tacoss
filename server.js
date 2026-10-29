@@ -59,6 +59,7 @@
      login · stats · online (النشطون الآن) · users · user · balance · ban · delete · webhook
      withdrawals · withdrawal · settings · saveSettings (تشمل ads و crash — لعبة الصاروخ و treasure — لعبة الكنز)
      tasks · saveTask · deleteTask · promos · savePromo · deletePromo
+     supportUnread · supportList · supportThread · supportReply · supportDelete   (الدعم الفني — والمستخدم: GET /api/support/state · POST /api/support/send)
      simInvite · reset   (تجريبيان — يعملان فقط مع ADMIN_DEMO_TOOLS=1)
    ════════════════════════════════════════════════════════════════════════ */
 'use strict';
@@ -93,6 +94,8 @@ const DEMO_TOOLS = process.env.ADMIN_DEMO_TOOLS === '1';
 const PUBLIC_URL = (process.env.PUBLIC_URL || (process.env.VERCEL_PROJECT_PRODUCTION_URL ? `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}` : '')).replace(/\/+$/, '');
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || derive('webhook').slice(0, 48);
 const APP_URL = process.env.APP_URL || '';
+// (اختياري) معرّف تيليجرام الرقمي للأدمن: يصله إشعار من البوت عند وصول رسالة دعم جديدة. الرد يكون من لوحة الإدارة ← تبويب «الدعم»
+const ADMIN_TG_ID = process.env.ADMIN_TG_ID || '';
 // روابط رسالة الترحيب (/start) — يمكن تغييرها من متغيرات البيئة دون تعديل الكود
 const FRONTEND_URL = APP_URL || 'https://jovial-marigold-96501a.netlify.app/'; // رابط التطبيق (زر «اربح الان»)
 const CHANNEL_URL = process.env.CHANNEL_URL || 'https://t.me/moneyslayerchannel';  // رابط القناة
@@ -164,7 +167,7 @@ const fail = (code, status = 400, extra = {}) => { throw new AppError(code, stat
    المجموعات: users (_id = معرّف تيليجرام) · tasks · promos (_id = الكود) · settings · meta
    كل تعديل على الرصيد يتم بتحديث ذرّي واحد (pipeline update) مع شرط في الفلتر،
    فلا يمكن لطلبين متزامنين خصم نفس الرصيد مرتين أو استلام نفس المكافأة مرتين. */
-let users, tasksC, promos, settingsC, metaC, crashC, crashBets, treasureC;
+let users, tasksC, promos, settingsC, metaC, crashC, crashBets, treasureC, supportC;
 
 async function seedTasks() {
   const first = await metaC.updateOne({ _id: 'seeded' }, { $setOnInsert: { at: Date.now() } }, { upsert: true });
@@ -179,14 +182,15 @@ async function connect() {
   const db = client.db(MONGODB_DB);
   users = db.collection('users'); tasksC = db.collection('tasks'); promos = db.collection('promos');
   settingsC = db.collection('settings'); metaC = db.collection('meta');
-  crashC = db.collection('crashRounds'); crashBets = db.collection('crashBets'); treasureC = db.collection('treasureGames');
+  crashC = db.collection('crashRounds'); crashBets = db.collection('crashBets'); treasureC = db.collection('treasureGames'); supportC = db.collection('support');
   await Promise.all([
     users.createIndex({ invitedBy: 1 }), users.createIndex({ totalEarned: -1 }), users.createIndex({ joinedAt: -1 }),
-    users.createIndex({ 'withdrawals.id': 1 }), promos.createIndex({ createdAt: -1 }), users.createIndex({ lastSeen: -1 }), users.createIndex({ crashSeen: -1 }),
+    users.createIndex({ 'withdrawals.id': 1 }), promos.createIndex({ createdAt: -1 }), users.createIndex({ lastSeen: -1 }), users.createIndex({ crashSeen: -1 }), users.createIndex({ balance: -1, joinedAt: 1 }),
     crashBets.createIndex({ round: 1, status: 1 }), crashBets.createIndex({ round: 1, uid: 1 }),
     treasureC.createIndex({ uid: 1 }, { unique: true, partialFilterExpression: { act: 1 } }), // لعبة جارية واحدة فقط لكل مستخدم
     treasureC.createIndex({ uid: 1, at: -1 }), treasureC.createIndex({ doneAt: 1 }, { expireAfterSeconds: 30 * 86400 }),
     crashBets.createIndex({ at: 1 }, { expireAfterSeconds: 7 * 86400 }), crashC.createIndex({ at: 1 }, { expireAfterSeconds: 7 * 86400 }),
+    supportC.createIndex({ lastAt: -1 }), supportC.createIndex({ unreadAdmin: 1 }),
   ]);
   await seedTasks();
   await ensureWebhook().catch((e) => console.error('setWebhook:', e.message));
@@ -705,17 +709,22 @@ U.post('/chest', wrap(async (req) => {
   return { profile: await profileOf(nu), reward: p.reward };
 }));
 
-// GET /api/leaderboard
+// GET /api/leaderboard[?limit=5..20] — الترتيب حسب الرصيد الحالي (balance) لحظيًا: يصعد المستخدم عند زيادة رصيده ويهبط عند السحب أو الخصم أو خسارة الألعاب
 U.get('/leaderboard', wrap(async (req) => {
-  const u = req.u, base = { banned: { $ne: true } };
-  const rows = await users.find(base).sort({ totalEarned: -1, joinedAt: 1 }).limit(5).project({ id: 1, first_name: 1, last_name: 1, totalEarned: 1 }).toArray();
-  const mk = (x, i) => { const amount = r2(x.totalEarned); return { name: x.id === u.id ? 'أنت' : `${x.first_name} ${(x.last_name || '')[0] || ''}.`.trim(), amount, total: amount, me: x.id === u.id, rank: i + 1 }; };
+  const base = { banned: { $ne: true } }, limit = Math.min(20, Math.max(3, Math.round(Number(req.query.limit)) || 5));
+  const [rows, cur] = await Promise.all([
+    users.find(base).sort({ balance: -1, joinedAt: 1 }).limit(limit).project({ id: 1, first_name: 1, last_name: 1, balance: 1, photo_url: 1 }).toArray(),
+    getUser(req.u.id), // رصيد المستخدم الآن (req.u قد يسبق آخر عملية بلحظات)
+  ]);
+  const u = cur || req.u, mine = r2(u.balance);
+  // الخصوصية: يُعاد للعميل الاسم المختصر + الصورة (رابط https فقط) + المبلغ — دون معرّف أو يوزر أو أي رابط يؤدي لحساب الشخص
+  const pic = (x) => (/^https:\/\//i.test(x.photo_url || '') ? x.photo_url : '');
+  const mk = (x, i) => { const amount = r2(x.balance); return { name: x.id === u.id ? 'أنت' : `${x.first_name} ${(x.last_name || '')[0] || ''}.`.trim(), photo: pic(x), amount, total: amount, me: x.id === u.id, rank: i + 1 }; };
   const top = rows.map(mk);
   let me = top.find((x) => x.me);
   if (!me) {
-    const ahead = await users.countDocuments({ ...base, totalEarned: { $gt: u.totalEarned } });
-    const amount = r2(u.totalEarned);
-    me = { name: 'أنت', amount, total: amount, me: true, rank: ahead + 1 };
+    const ahead = await users.countDocuments({ ...base, $or: [{ balance: { $gt: u.balance } }, { balance: u.balance, joinedAt: { $lt: u.joinedAt } }] });
+    me = { name: 'أنت', photo: pic(u), amount: mine, total: mine, me: true, rank: ahead + 1 };
   }
   return { top, me };
 }));
@@ -1068,6 +1077,58 @@ U.post('/treasure/cashout', limiter('tcash', 120, 60000, (req) => req.u.id), wra
   return { cashed: true, win: r.win, mult: r.mult, picked: r.picked, bomb: r.bomb, balance: await balanceOf(u.id) };
 }));
 
+/* ═══════════════ الدعم الفني (محادثة واحدة لكل مستخدم) ═══════════════
+   المجموعة support: _id = معرّف المستخدم · msgs[{id,from:'user'|'admin'|'bot',text,at}] (آخر 300 رسالة)
+   unreadAdmin = رسائل المستخدم التي لم يقرأها الأدمن · unreadUser = ردود الأدمن التي لم يقرأها المستخدم
+   autoAt = آخر رد آلي · adminAt = آخر رد للأدمن (لا يُرسل رد آلي مكرَّر خلال 6 ساعات، ولا بعد رد الأدمن بـ 30 دقيقة) */
+const SUP_MAX = 300, SUP_TXT = 1000;
+const SUP_WELCOME = 'أهلًا بك في مركز الدعم 👋\n\nيسعدنا خدمتك دائمًا. اكتب استفسارك أو مشكلتك هنا بالتفصيل — سواء كانت بخصوص السحب أو المهام أو الرصيد أو أي موضوع آخر — وسيصلك الرد داخل هذه الصفحة مباشرة.\n\n💡 لنساعدك أسرع: اذكر تفاصيل مشكلتك بوضوح (المبلغ، اسم المهمة، وقت حدوثها).';
+const SUP_AUTO = '✅ تم استلام رسالتك بنجاح.\n\nسيرد عليك السيد قريبًا. سيصلك الرد هنا في هذه الصفحة، فلا داعي لإعادة إرسال الرسالة. شكرًا لصبرك وثقتك 🤍';
+const supClean = (v) => String(v ?? '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '').trim().slice(0, SUP_TXT);
+const supMsg = (from, text) => ({ id: crypto.randomBytes(6).toString('hex'), from, text, at: Date.now() });
+const supPush = (m) => ({ $each: [m], $slice: -SUP_MAX });
+const supPub = (d, n = 100) => (d.msgs || []).slice(-n).map(({ id, from, text, at }) => ({ id, from, text, at }));
+
+/** ينشئ محادثة المستخدم برسالة الترحيب عند أول فتح (lastAt=0 تعني: لم يكتب شيئًا بعد، فلا تظهر في لوحة الأدمن) */
+async function supEnsure(u) {
+  const d = await supportC.findOne({ _id: u.id });
+  if (d) return d;
+  try { await supportC.insertOne({ _id: u.id, uid: u.id, name: fullName(u), username: u.username || '', msgs: [supMsg('bot', SUP_WELCOME)], lastAt: 0, lastFrom: '', lastText: '', unreadAdmin: 0, unreadUser: 0, autoAt: 0, adminAt: 0 }); }
+  catch (e) { if (e.code !== 11000) throw e; }
+  return supportC.findOne({ _id: u.id });
+}
+
+// GET /api/support/state[?peek=1] — peek: عدد الردود غير المقروءة فقط (للشارة)؛ بدونها: الرسائل (وتُعتبر مقروءة)
+U.get('/support/state', limiter('supstate', 120, 60000, (req) => req.u.id), wrap(async (req) => {
+  const u = req.u;
+  if (req.query.peek) { const d = await supportC.findOne({ _id: u.id }, { projection: { unreadUser: 1 } }); return { unread: (d && d.unreadUser) || 0 }; }
+  const d = await supEnsure(u);
+  if (d.unreadUser) await supportC.updateOne({ _id: u.id }, { $set: { unreadUser: 0 } });
+  return { messages: supPub(d) };
+}));
+
+// POST /api/support/send {text} — يضيف رسالة المستخدم + رد آلي «سيرد عليك السيد قريبًا» + إشعار تيليجرام للأدمن (إن ضُبط ADMIN_TG_ID)
+U.post('/support/send', limiter('supsend', 20, 60000, (req) => req.u.id), wrap(async (req) => {
+  const u = req.u, text = supClean(req.body?.text);
+  if (!text) fail('bad_value');
+  await supEnsure(u);
+  const now = Date.now();
+  const before = await supportC.findOneAndUpdate({ _id: u.id }, {
+    $push: { msgs: supPush(supMsg('user', text)) },
+    $set: { lastAt: now, lastFrom: 'user', lastText: text.slice(0, 120), name: fullName(u), username: u.username || '' },
+    $inc: { unreadAdmin: 1 },
+  }, { returnDocument: 'before' });
+  // رد آلي ذرّي: ينجح مرة واحدة فقط حتى لو وصلت رسالتان معًا
+  await supportC.updateOne(
+    { _id: u.id, autoAt: { $not: { $gt: now - 6 * 3600000 } }, adminAt: { $not: { $gt: now - 30 * 60000 } } },
+    { $push: { msgs: supPush(supMsg('bot', SUP_AUTO)) }, $set: { autoAt: Date.now() } },
+  );
+  if (BOT_TOKEN && ADMIN_TG_ID && !(before && before.unreadAdmin > 0)) { // إشعار واحد لكل دفعة رسائل غير مقروءة
+    await tgCall('sendMessage', { chat_id: ADMIN_TG_ID, text: `📩 رسالة دعم جديدة\n👤 ${fullName(u)}${u.username ? ` (@${u.username})` : ''}\n🆔 ${u.id}\n\n${text.slice(0, 500)}\n\nللرد: لوحة الإدارة ← الدعم` }).catch(() => {});
+  }
+  return { messages: supPub(await supportC.findOne({ _id: u.id })) };
+}));
+
 /* ═══════════════ الإدارة: POST /api/admin/:action ═══════════════ */
 const signAdmin = (exp) => `${exp}.${crypto.createHmac('sha256', ADMIN_SECRET).update(String(exp)).digest('hex')}`;
 const checkAdmin = (tok) => { const [exp, sig] = String(tok || '').split('.'); return !!exp && !!sig && Number(exp) > Date.now() && safeEq(signAdmin(exp), `${exp}.${sig}`); };
@@ -1175,6 +1236,45 @@ const ADMIN = {
     if (status === 'rejected') await credit({ _id: x._id }, 'admin', w.amount, { ref: 'إرجاع سحب مرفوض' }, { earn: false });
     return { ok: true };
   },
+  /* الدعم: supportUnread → {unread} · supportList {filter:'all|unread'} → {conversations,unread}
+     supportThread {id} → {user,messages} (يُعلَّم مقروءًا) · supportReply {id,text} → {messages} · supportDelete {id} */
+  supportUnread: async () => ({ unread: await supportC.countDocuments({ unreadAdmin: { $gt: 0 } }) }),
+  supportList: async (b) => {
+    const flt = { lastAt: { $gt: 0 }, ...(b.filter === 'unread' ? { unreadAdmin: { $gt: 0 } } : {}) };
+    const [rows, unread] = await Promise.all([
+      supportC.find(flt).sort({ lastAt: -1 }).limit(150).project({ msgs: 0 }).toArray(),
+      supportC.countDocuments({ unreadAdmin: { $gt: 0 } }),
+    ]);
+    return { unread, conversations: rows.map((d) => ({ id: d._id, name: d.name || '—', username: d.username || '', lastText: d.lastText || '', lastFrom: d.lastFrom || '', lastAt: d.lastAt || 0, unread: d.unreadAdmin || 0 })) };
+  },
+  supportThread: async (b) => {
+    const id = Number(b.id);
+    if (!Number.isSafeInteger(id) || id <= 0) fail('bad_value');
+    const d = await supportC.findOneAndUpdate({ _id: id }, { $set: { unreadAdmin: 0 } }, { returnDocument: 'after' });
+    if (!d) fail('not_found', 404);
+    return { user: { id: d._id, name: d.name || '—', username: d.username || '' }, messages: supPub(d, 200) };
+  },
+  supportReply: async (b) => {
+    const id = Number(b.id), text = supClean(b.text);
+    if (!Number.isSafeInteger(id) || id <= 0 || !text) fail('bad_value');
+    const now = Date.now();
+    const before = await supportC.findOneAndUpdate({ _id: id }, {
+      $push: { msgs: supPush(supMsg('admin', text)) },
+      $set: { lastAt: now, lastFrom: 'admin', lastText: text.slice(0, 120), adminAt: now, unreadAdmin: 0 },
+      $inc: { unreadUser: 1 },
+    }, { returnDocument: 'before' });
+    if (!before) fail('not_found', 404);
+    if (BOT_TOKEN && !(before.unreadUser > 0)) { // تنبيه للمستخدم في تيليجرام (يفشل بصمت إن لم يبدأ البوت)
+      await tgCall('sendMessage', { chat_id: id, text: '💬 وصلك رد جديد من الدعم الفني.\nافتح التطبيق واضغط «الدعم» لقراءته.', reply_markup: { inline_keyboard: [[{ text: 'فتح الدعم 💬', web_app: { url: FRONTEND_URL } }]] } }).catch(() => {});
+    }
+    return { messages: supPub(await supportC.findOne({ _id: id }), 200) };
+  },
+  supportDelete: async (b) => {
+    const id = Number(b.id);
+    if (!Number.isSafeInteger(id) || id <= 0) fail('bad_value');
+    await supportC.deleteOne({ _id: id });
+    return { ok: true };
+  },
   // يسجّل webhook البوت ويعرض حالته (للتشخيص من لوحة الإدارة)
   webhook: async (b) => {
     if (!BOT_TOKEN || !WEBHOOK_SECRET) fail('not_found', 404);
@@ -1242,7 +1342,7 @@ const ADMIN = {
   // إعادة ضبط كل البيانات (تجريبي — معطّل افتراضيًا لأنه يمسح قاعدة البيانات بالكامل)
   reset: async () => {
     if (!DEMO_TOOLS) fail('not_found', 404);
-    await Promise.all([users, tasksC, promos, settingsC, metaC, crashC, crashBets].map((c) => c.deleteMany({})));
+    await Promise.all([users, tasksC, promos, settingsC, metaC, crashC, crashBets, supportC].map((c) => c.deleteMany({})));
     cfgCache = { at: 0, v: null };
     await seedTasks();
     return { ok: true };
