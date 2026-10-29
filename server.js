@@ -115,6 +115,7 @@ const DEFAULT_CONFIG = {
   minWithdraw: 5,
   welcomeBonus: 0.5,
   referralReward: 1,
+  refSourceTags: true, // روابط الدعوة تحمل وسم المنصة (ref_ID_wa …) — الخادم يفهمها ويسجّل مصدر كل إحالة
   checkinRewards: [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.5],
   dailyGoal: 3,
   chestReward: 0.3,
@@ -272,7 +273,7 @@ const CFG = async () => { const c = await RAW(); return { ...c, methods: (c.meth
 const mkUser = (id, o = {}) => ({
   id, first_name: '', last_name: '', username: '', photo_url: '', balance: 0, totalEarned: 0, referralEarnings: 0, completed: 0, streak: 0,
   lastCheckin: 0, lastSpin: 0, lastAd: 0, adSession: 0, adDays: {}, adsEarned: 0, taskState: {}, taskDays: {}, chestDay: '', milestones: [],
-  joinedAt: Date.now(), onboarded: true, history: [], withdrawals: [], invitedBy: 0, pendingRef: 0, refBonus: 0, banned: false, banReason: '', usedPromos: [], lastWithdrawAt: 0, ...o,
+  joinedAt: Date.now(), onboarded: true, history: [], withdrawals: [], invitedBy: 0, pendingRef: 0, pendingSrc: '', refSource: '', refBonus: 0, banned: false, banReason: '', usedPromos: [], lastWithdrawAt: 0, ...o,
 });
 const getUser = (id) => users.findOne({ _id: Number(id) });
 const curStreak = (u) => (Date.now() - u.lastCheckin > 2 * DAY ? 0 : u.streak);
@@ -324,10 +325,12 @@ const publicTask = (t, u) => {
    (أي أول ظهور للحساب سواء من التطبيق أو من ضغط Start في البوت) تُحتسب الإحالة لصاحب الرابط.
    لا يوجد وضع وسيط «مُنشأ لكن لم يُحتسب»: إن فشلت الإحالة تُسجَّل في السجل ولا يتعطل الدخول.
    المصادر: start_param من رابط التطبيق (startapp=ref_ID) أو من رابط البوت (start=ref_ID) — كلاهما بالصيغة نفسها. */
-const parseRef = (sp) => { const m = /^(?:ref_)?(\d{3,15})$/.exec(String(sp || '').trim()); return m ? Number(m[1]) : 0; };
+const REF_RE = /^(?:ref_)?(\d{3,15})(?:_(tg|wa|fb|x|ig))?$/; // ref_123 أو ref_123_wa (وسم المنصة اختياري)
+const parseRef = (sp) => { const m = REF_RE.exec(String(sp || '').trim()); return m ? Number(m[1]) : 0; };
+const parseRefSrc = (sp) => { const m = REF_RE.exec(String(sp || '').trim()); return m && m[2] ? m[2] : ''; };
 
 /** يربط الحساب الجديد بالمُحيل ويمنحه المكافأة. يعيد المُحيل أو null (مع سبب في السجل) */
-async function applyReferral(u, refId, c) {
+async function applyReferral(u, refId, c, src = '') {
   if (!refId) return null;
   if (refId === u.id) { console.log(`[ref] skip self ${u.id}`); return null; }
   const inviter = await getUser(refId);
@@ -335,15 +338,15 @@ async function applyReferral(u, refId, c) {
   if (inviter.banned) { console.log(`[ref] skip: inviter ${refId} banned`); return null; }
   const rw = r2(c.referralReward);
   // ربط ذرّي: ينجح مرة واحدة فقط لهذا الحساب
-  const claim = await users.updateOne({ _id: u.id, invitedBy: 0 }, { $set: { invitedBy: inviter.id, refBonus: rw } });
+  const claim = await users.updateOne({ _id: u.id, invitedBy: 0 }, { $set: { invitedBy: inviter.id, refBonus: rw, refSource: src } });
   if (!claim.modifiedCount) return null;
   try {
     if (rw > 0) await credit({ _id: inviter.id }, 'referral', rw, { ref: u.first_name || 'صديق' }, { expr: { referralEarnings: rnd('$referralEarnings', rw) } });
   } catch (e) { // تراجع عن الربط كي لا يُحسب صديق بلا مكافأة
-    await users.updateOne({ _id: u.id }, { $set: { invitedBy: 0, refBonus: 0 } }).catch(() => {});
+    await users.updateOne({ _id: u.id }, { $set: { invitedBy: 0, refBonus: 0, refSource: '' } }).catch(() => {});
     throw e;
   }
-  console.log(`[ref] ok: ${u.id} invited by ${inviter.id} (+${rw})`);
+  console.log(`[ref] ok: ${u.id} invited by ${inviter.id} (+${rw})${src ? ` via ${src}` : ''}`);
   return inviter;
 }
 
@@ -369,11 +372,11 @@ async function registerUser(tgUser, startParam, { fromBot = false } = {}) {
   const created = !(res.lastErrorObject && res.lastErrorObject.updatedExisting);
   let inviter = null;
   if (created && !u.banned) {
-    const refId = parseRef(startParam);
+    const refId = parseRef(startParam), src = parseRefSrc(startParam);
     if (fromBot) { // Start في البوت: تأجيل الإحالة حتى يدخل التطبيق فعلًا
-      if (refId && refId !== id) await users.updateOne({ _id: id, invitedBy: 0 }, { $set: { pendingRef: refId } }).catch((e) => console.error('pendingRef:', e.message));
+      if (refId && refId !== id) await users.updateOne({ _id: id, invitedBy: 0 }, { $set: { pendingRef: refId, pendingSrc: src } }).catch((e) => console.error('pendingRef:', e.message));
     } else {
-      try { inviter = await applyReferral(u, refId, c); }
+      try { inviter = await applyReferral(u, refId, c, src); }
       catch (e) { console.error('referral:', e.message); }
     }
   } else if (!fromBot && !u.banned && u.pendingRef > 0 && !u.invitedBy) {
@@ -381,7 +384,7 @@ async function registerUser(tgUser, startParam, { fromBot = false } = {}) {
     const refId = u.pendingRef;
     const claim = await users.updateOne({ _id: id, pendingRef: refId, invitedBy: 0 }, { $set: { pendingRef: 0 } });
     if (claim.modifiedCount) {
-      try { inviter = await applyReferral(u, refId, c); }
+      try { inviter = await applyReferral(u, refId, c, u.pendingSrc || ''); }
       catch (e) { console.error('referral:', e.message); await users.updateOne({ _id: id, pendingRef: 0 }, { $set: { pendingRef: refId } }).catch(() => {}); } // يُعاد المحاولة عند الدخول التالي
     }
   }
@@ -733,7 +736,10 @@ U.get('/leaderboard', wrap(async (req) => {
 U.get('/referrals', wrap(async (req) => {
   const list = await users.find({ invitedBy: req.u.id }).sort({ joinedAt: -1 }).limit(500).toArray();
   const f = list.map((x) => ({ name: x.first_name, joinedAt: x.joinedAt, earned: x.refBonus || 0 }));
-  return { friends: f, stats: { count: await users.countDocuments({ invitedBy: req.u.id }), earned: r2(req.u.referralEarnings) } };
+  const bySource = {};
+  (await users.aggregate([{ $match: { invitedBy: req.u.id } }, { $group: { _id: '$refSource', n: { $sum: 1 } } }]).toArray())
+    .forEach((g) => { bySource[g._id || 'other'] = g.n; }); // tg / wa / fb / x / ig، و other = بلا وسم
+  return { friends: f, stats: { count: await users.countDocuments({ invitedBy: req.u.id }), earned: r2(req.u.referralEarnings), bySource } };
 }));
 
 // POST /api/referrals/milestone {friends}
