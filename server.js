@@ -44,7 +44,7 @@
      GET  /api/referrals
      POST /api/referrals/milestone    {friends}
      POST /api/promo/redeem           {code}
-     POST /api/ads/start    يبدأ جلسة مشاهدة (يعيد duration/reward/zoneId)
+     POST /api/ads/start    يبدأ جلسة مشاهدة (يعيد duration/reward/directLink/zoneId)
      POST /api/ads/claim    يصرف المكافأة فقط بعد مرور duration كاملة منذ start وبعد انتهاء المؤقت بين الإعلانين
      POST /api/withdraw               {method,amount,address} | {method:'bank',amount,address,bank,holder,country,countryName}
      GET  /api/crash/state            حالة الجولة المشتركة + رهاناتي + اللاعبون + السجل + رصيدي (يستعلم عنها التطبيق دوريًا)
@@ -115,14 +115,14 @@ const DEFAULT_CONFIG = {
   minWithdraw: 5,
   welcomeBonus: 0.5,
   referralReward: 1,
-  refSourceTags: true, // روابط الدعوة تحمل وسم المنصة (ref_ID_wa …) — الخادم يفهمها ويسجّل مصدر كل إحالة
   checkinRewards: [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.5],
   dailyGoal: 3,
   chestReward: 0.3,
   milestones: [{ friends: 5, bonus: 2 }, { friends: 10, bonus: 5 }, { friends: 25, bonus: 15 }, { friends: 50, bonus: 40 }],
   // ads (تُدار كلها من لوحة الأدمن عبر saveSettings): reward = مكافأة الإعلان · cooldown = المؤقت بين إعلانين (ثانية) · duration = أقل مدة مشاهدة قبل صرف المكافأة (ثانية) · dailyLimit = حد يومي
-  //      zoneId = رقم منطقة SDK الإعلانات (libtl.com) — يقرؤه التطبيق من /api/config ويستدعي show_<zoneId>()
-  ads: { enabled: true, reward: 0.02, dailyLimit: 50, duration: 15, cooldown: 10, blockId: '', zoneId: '12092133' },
+  //      directLink = رابط إعلاني مباشر (Direct Link) يفتحه التطبيق داخل تيليجرام بدل SDK — إن وُجد يُستخدم هو أولًا
+  //      zoneId = رقم منطقة SDK الإعلانات (libtl.com) — احتياطي: يُستخدم فقط إذا كان directLink فارغًا
+  ads: { enabled: true, reward: 0.02, dailyLimit: 50, duration: 15, cooldown: 10, blockId: '', zoneId: '12092133', directLink: 'https://uplcm.com/4/10241050' },
   // crash: لعبة الصاروخ التجريبية — enabled = إظهار زر اللعبة · startBalance = الرصيد التجريبي الابتدائي · minBet/maxBet = حدود الرهان · waitSec = الانتظار بين الجولات (ثانية) · rtp = نسبة العائد للاعب %
   //        الحد الأقصى للمضاعف ثابت 22× (CRASH_CAP) · الرهان من 0.3 إلى 1000 · rtp=88 يعني ميزة معلنة للمنصة 12% على كل الرهانات
   crash: { enabled: true, startBalance: 1000, minBet: 0.3, maxBet: 1000, waitSec: 5, rtp: 88 },
@@ -216,6 +216,10 @@ function sanitizeAds(inp, cur) {
   out.dailyLimit = num(inp.dailyLimit, cur.dailyLimit, 1, 10000);
   out.zoneId = String(inp.zoneId === undefined ? (cur.zoneId || '') : inp.zoneId).replace(/[^0-9A-Za-z_-]/g, '').slice(0, 40);
   out.blockId = String(inp.blockId === undefined ? (cur.blockId || '') : inp.blockId).slice(0, 60);
+  // الرابط الإعلاني المباشر: فارغ (تعطيله) أو رابط https صالح فقط
+  const dl = String(inp.directLink === undefined ? (cur.directLink || '') : inp.directLink).trim().slice(0, 500);
+  if (dl && !/^https:\/\/[^\s<>"']+$/i.test(dl)) fail('bad_value');
+  out.directLink = dl;
   return out;
 }
 
@@ -273,7 +277,7 @@ const CFG = async () => { const c = await RAW(); return { ...c, methods: (c.meth
 const mkUser = (id, o = {}) => ({
   id, first_name: '', last_name: '', username: '', photo_url: '', balance: 0, totalEarned: 0, referralEarnings: 0, completed: 0, streak: 0,
   lastCheckin: 0, lastSpin: 0, lastAd: 0, adSession: 0, adDays: {}, adsEarned: 0, taskState: {}, taskDays: {}, chestDay: '', milestones: [],
-  joinedAt: Date.now(), onboarded: true, history: [], withdrawals: [], invitedBy: 0, pendingRef: 0, pendingSrc: '', refSource: '', refBonus: 0, banned: false, banReason: '', usedPromos: [], lastWithdrawAt: 0, ...o,
+  joinedAt: Date.now(), onboarded: true, history: [], withdrawals: [], invitedBy: 0, pendingRef: 0, refBonus: 0, banned: false, banReason: '', usedPromos: [], lastWithdrawAt: 0, ...o,
 });
 const getUser = (id) => users.findOne({ _id: Number(id) });
 const curStreak = (u) => (Date.now() - u.lastCheckin > 2 * DAY ? 0 : u.streak);
@@ -325,12 +329,10 @@ const publicTask = (t, u) => {
    (أي أول ظهور للحساب سواء من التطبيق أو من ضغط Start في البوت) تُحتسب الإحالة لصاحب الرابط.
    لا يوجد وضع وسيط «مُنشأ لكن لم يُحتسب»: إن فشلت الإحالة تُسجَّل في السجل ولا يتعطل الدخول.
    المصادر: start_param من رابط التطبيق (startapp=ref_ID) أو من رابط البوت (start=ref_ID) — كلاهما بالصيغة نفسها. */
-const REF_RE = /^(?:ref_)?(\d{3,15})(?:_(tg|wa|fb|x|ig))?$/; // ref_123 أو ref_123_wa (وسم المنصة اختياري)
-const parseRef = (sp) => { const m = REF_RE.exec(String(sp || '').trim()); return m ? Number(m[1]) : 0; };
-const parseRefSrc = (sp) => { const m = REF_RE.exec(String(sp || '').trim()); return m && m[2] ? m[2] : ''; };
+const parseRef = (sp) => { const m = /^(?:ref_)?(\d{3,15})$/.exec(String(sp || '').trim()); return m ? Number(m[1]) : 0; };
 
 /** يربط الحساب الجديد بالمُحيل ويمنحه المكافأة. يعيد المُحيل أو null (مع سبب في السجل) */
-async function applyReferral(u, refId, c, src = '') {
+async function applyReferral(u, refId, c) {
   if (!refId) return null;
   if (refId === u.id) { console.log(`[ref] skip self ${u.id}`); return null; }
   const inviter = await getUser(refId);
@@ -338,15 +340,15 @@ async function applyReferral(u, refId, c, src = '') {
   if (inviter.banned) { console.log(`[ref] skip: inviter ${refId} banned`); return null; }
   const rw = r2(c.referralReward);
   // ربط ذرّي: ينجح مرة واحدة فقط لهذا الحساب
-  const claim = await users.updateOne({ _id: u.id, invitedBy: 0 }, { $set: { invitedBy: inviter.id, refBonus: rw, refSource: src } });
+  const claim = await users.updateOne({ _id: u.id, invitedBy: 0 }, { $set: { invitedBy: inviter.id, refBonus: rw } });
   if (!claim.modifiedCount) return null;
   try {
     if (rw > 0) await credit({ _id: inviter.id }, 'referral', rw, { ref: u.first_name || 'صديق' }, { expr: { referralEarnings: rnd('$referralEarnings', rw) } });
   } catch (e) { // تراجع عن الربط كي لا يُحسب صديق بلا مكافأة
-    await users.updateOne({ _id: u.id }, { $set: { invitedBy: 0, refBonus: 0, refSource: '' } }).catch(() => {});
+    await users.updateOne({ _id: u.id }, { $set: { invitedBy: 0, refBonus: 0 } }).catch(() => {});
     throw e;
   }
-  console.log(`[ref] ok: ${u.id} invited by ${inviter.id} (+${rw})${src ? ` via ${src}` : ''}`);
+  console.log(`[ref] ok: ${u.id} invited by ${inviter.id} (+${rw})`);
   return inviter;
 }
 
@@ -372,11 +374,11 @@ async function registerUser(tgUser, startParam, { fromBot = false } = {}) {
   const created = !(res.lastErrorObject && res.lastErrorObject.updatedExisting);
   let inviter = null;
   if (created && !u.banned) {
-    const refId = parseRef(startParam), src = parseRefSrc(startParam);
+    const refId = parseRef(startParam);
     if (fromBot) { // Start في البوت: تأجيل الإحالة حتى يدخل التطبيق فعلًا
-      if (refId && refId !== id) await users.updateOne({ _id: id, invitedBy: 0 }, { $set: { pendingRef: refId, pendingSrc: src } }).catch((e) => console.error('pendingRef:', e.message));
+      if (refId && refId !== id) await users.updateOne({ _id: id, invitedBy: 0 }, { $set: { pendingRef: refId } }).catch((e) => console.error('pendingRef:', e.message));
     } else {
-      try { inviter = await applyReferral(u, refId, c, src); }
+      try { inviter = await applyReferral(u, refId, c); }
       catch (e) { console.error('referral:', e.message); }
     }
   } else if (!fromBot && !u.banned && u.pendingRef > 0 && !u.invitedBy) {
@@ -384,7 +386,7 @@ async function registerUser(tgUser, startParam, { fromBot = false } = {}) {
     const refId = u.pendingRef;
     const claim = await users.updateOne({ _id: id, pendingRef: refId, invitedBy: 0 }, { $set: { pendingRef: 0 } });
     if (claim.modifiedCount) {
-      try { inviter = await applyReferral(u, refId, c, u.pendingSrc || ''); }
+      try { inviter = await applyReferral(u, refId, c); }
       catch (e) { console.error('referral:', e.message); await users.updateOne({ _id: id, pendingRef: 0 }, { $set: { pendingRef: refId } }).catch(() => {}); } // يُعاد المحاولة عند الدخول التالي
     }
   }
@@ -736,10 +738,7 @@ U.get('/leaderboard', wrap(async (req) => {
 U.get('/referrals', wrap(async (req) => {
   const list = await users.find({ invitedBy: req.u.id }).sort({ joinedAt: -1 }).limit(500).toArray();
   const f = list.map((x) => ({ name: x.first_name, joinedAt: x.joinedAt, earned: x.refBonus || 0 }));
-  const bySource = {};
-  (await users.aggregate([{ $match: { invitedBy: req.u.id } }, { $group: { _id: '$refSource', n: { $sum: 1 } } }]).toArray())
-    .forEach((g) => { bySource[g._id || 'other'] = g.n; }); // tg / wa / fb / x / ig، و other = بلا وسم
-  return { friends: f, stats: { count: await users.countDocuments({ invitedBy: req.u.id }), earned: r2(req.u.referralEarnings), bySource } };
+  return { friends: f, stats: { count: await users.countDocuments({ invitedBy: req.u.id }), earned: r2(req.u.referralEarnings) } };
 }));
 
 // POST /api/referrals/milestone {friends}
@@ -786,7 +785,7 @@ U.post('/ads/start', wrap(async (req) => {
   const nextAt = u.lastAd ? u.lastAd + a.cooldown * 1000 : 0;
   if (nextAt && now < nextAt) fail('ads_wait', 429, { wait: Math.ceil((nextAt - now) / 1000) });
   const nu = await mutate({ _id: u.id }, { set: { adSession: now } });
-  return { duration: a.duration, reward: a.reward, zoneId: a.zoneId || '', ads: (await profileOf(nu)).ads };
+  return { duration: a.duration, reward: a.reward, directLink: a.directLink || '', zoneId: a.zoneId || '', ads: (await profileOf(nu)).ads };
 }));
 
 // POST /api/ads/claim — لا تُصرف المكافأة إلا بعد مرور مدة الإعلان كاملة (duration) منذ start، ومرة واحدة لكل جلسة
