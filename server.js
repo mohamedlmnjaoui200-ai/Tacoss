@@ -44,7 +44,7 @@
      GET  /api/referrals
      POST /api/referrals/milestone    {friends}
      POST /api/promo/redeem           {code}
-     POST /api/ads/start    يبدأ جلسة مشاهدة (يعيد duration/reward/directLink/zoneId)
+     POST /api/ads/start    يبدأ جلسة مشاهدة (يعيد duration/reward/zoneId)
      POST /api/ads/claim    يصرف المكافأة فقط بعد مرور duration كاملة منذ start وبعد انتهاء المؤقت بين الإعلانين
      POST /api/withdraw               {method,amount,address} | {method:'bank',amount,address,bank,holder,country,countryName}
      GET  /api/crash/state            حالة الجولة المشتركة + رهاناتي + اللاعبون + السجل + رصيدي (يستعلم عنها التطبيق دوريًا)
@@ -120,9 +120,8 @@ const DEFAULT_CONFIG = {
   chestReward: 0.3,
   milestones: [{ friends: 5, bonus: 2 }, { friends: 10, bonus: 5 }, { friends: 25, bonus: 15 }, { friends: 50, bonus: 40 }],
   // ads (تُدار كلها من لوحة الأدمن عبر saveSettings): reward = مكافأة الإعلان · cooldown = المؤقت بين إعلانين (ثانية) · duration = أقل مدة مشاهدة قبل صرف المكافأة (ثانية) · dailyLimit = حد يومي
-  //      directLink = رابط إعلاني مباشر (Direct Link) يفتحه التطبيق داخل تيليجرام بدل SDK — إن وُجد يُستخدم هو أولًا
-  //      zoneId = رقم منطقة SDK الإعلانات (libtl.com) — احتياطي: يُستخدم فقط إذا كان directLink فارغًا
-  ads: { enabled: true, reward: 0.02, dailyLimit: 50, duration: 15, cooldown: 10, blockId: '', zoneId: '12092133', directLink: 'https://uplcm.com/4/10241050' },
+  //      zoneId = رقم منطقة SDK الإعلانات (libtl.com) — يقرؤه التطبيق من /api/config ويستدعي show_<zoneId>()
+  ads: { enabled: true, reward: 0.02, dailyLimit: 50, duration: 15, cooldown: 10, blockId: '', zoneId: '12092133' },
   // crash: لعبة الصاروخ التجريبية — enabled = إظهار زر اللعبة · startBalance = الرصيد التجريبي الابتدائي · minBet/maxBet = حدود الرهان · waitSec = الانتظار بين الجولات (ثانية) · rtp = نسبة العائد للاعب %
   //        الحد الأقصى للمضاعف ثابت 22× (CRASH_CAP) · الرهان من 0.3 إلى 1000 · rtp=88 يعني ميزة معلنة للمنصة 12% على كل الرهانات
   crash: { enabled: true, startBalance: 1000, minBet: 0.3, maxBet: 1000, waitSec: 5, rtp: 88 },
@@ -216,10 +215,6 @@ function sanitizeAds(inp, cur) {
   out.dailyLimit = num(inp.dailyLimit, cur.dailyLimit, 1, 10000);
   out.zoneId = String(inp.zoneId === undefined ? (cur.zoneId || '') : inp.zoneId).replace(/[^0-9A-Za-z_-]/g, '').slice(0, 40);
   out.blockId = String(inp.blockId === undefined ? (cur.blockId || '') : inp.blockId).slice(0, 60);
-  // الرابط الإعلاني المباشر: فارغ (تعطيله) أو رابط https صالح فقط
-  const dl = String(inp.directLink === undefined ? (cur.directLink || '') : inp.directLink).trim().slice(0, 500);
-  if (dl && !/^https:\/\/[^\s<>"']+$/i.test(dl)) fail('bad_value');
-  out.directLink = dl;
   return out;
 }
 
@@ -785,7 +780,7 @@ U.post('/ads/start', wrap(async (req) => {
   const nextAt = u.lastAd ? u.lastAd + a.cooldown * 1000 : 0;
   if (nextAt && now < nextAt) fail('ads_wait', 429, { wait: Math.ceil((nextAt - now) / 1000) });
   const nu = await mutate({ _id: u.id }, { set: { adSession: now } });
-  return { duration: a.duration, reward: a.reward, directLink: a.directLink || '', zoneId: a.zoneId || '', ads: (await profileOf(nu)).ads };
+  return { duration: a.duration, reward: a.reward, zoneId: a.zoneId || '', ads: (await profileOf(nu)).ads };
 }));
 
 // POST /api/ads/claim — لا تُصرف المكافأة إلا بعد مرور مدة الإعلان كاملة (duration) منذ start، ومرة واحدة لكل جلسة
