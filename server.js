@@ -101,7 +101,7 @@ const ADMIN_TG_ID = process.env.ADMIN_TG_ID || '';
 // مفتاح Postback الخاص بـ AdBlueMedia (يُشتق من BOT_TOKEN إن لم يُضبط). يُوضع في رابط إعادة الإرسال ?key=... ويستعرضه الأدمن عبر الإجراء postbackUrl
 const POSTBACK_KEY = process.env.POSTBACK_KEY || derive('postback').slice(0, 32);
 // روابط رسالة الترحيب (/start) — يمكن تغييرها من متغيرات البيئة دون تعديل الكود
-const FRONTEND_URL = APP_URL || 'https://jovial-marigold-96501a.netlify.app/'; // رابط التطبيق (زر «اربح الان»)
+const FRONTEND_URL = APP_URL || 'https://comfy-begonia-50dc4a.netlify.app/'; // رابط التطبيق (زر «اربح الان»)
 const CHANNEL_URL = process.env.CHANNEL_URL || 'https://t.me/moneyslayerchannel';  // رابط القناة
 const GROUP_URL = process.env.GROUP_URL || 'https://t.me/moneyslayergroup';        // رابط المجموعة
 const INIT_MAX_AGE = 24 * 3600; // ثانية — عمر initData المسموح
