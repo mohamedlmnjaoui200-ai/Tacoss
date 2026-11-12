@@ -46,6 +46,8 @@
      POST /api/promo/redeem           {code}
      POST /api/ads/start    يبدأ جلسة مشاهدة (يعيد duration/reward/zoneId)
      POST /api/ads/claim    يصرف المكافأة فقط بعد مرور duration كاملة منذ start وبعد انتهاء المؤقت بين الإعلانين
+     GET  /api/contest                مسابقة السفر والعمل في هولندا: أعدادي (إعلانات/دعوات/مهام) + حالة التحقق + رتبتي + أفضل 10
+     POST /api/contest/verify         يتحقق الخادم من اكتمال الشروط الثلاثة ويعتمد المشاركة (مرة واحدة)
      POST /api/withdraw               {method,amount,address} | {method:'bank',amount,address,bank,holder,country,countryName}
      GET  /api/crash/state            حالة الجولة المشتركة + رهاناتي + اللاعبون + السجل + رصيدي (يستعلم عنها التطبيق دوريًا)
      POST /api/crash/bet              {slot:0|1, amount, autoAt?}   يخصم الرهان فورًا (قبل الإقلاع فقط)
@@ -96,6 +98,8 @@ const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || derive('webhook').slice(0, 
 const APP_URL = process.env.APP_URL || '';
 // (اختياري) معرّف تيليجرام الرقمي للأدمن: يصله إشعار من البوت عند وصول رسالة دعم جديدة. الرد يكون من لوحة الإدارة ← تبويب «الدعم»
 const ADMIN_TG_ID = process.env.ADMIN_TG_ID || '';
+// مفتاح Postback الخاص بـ AdBlueMedia (يُشتق من BOT_TOKEN إن لم يُضبط). يُوضع في رابط إعادة الإرسال ?key=... ويستعرضه الأدمن عبر الإجراء postbackUrl
+const POSTBACK_KEY = process.env.POSTBACK_KEY || derive('postback').slice(0, 32);
 // روابط رسالة الترحيب (/start) — يمكن تغييرها من متغيرات البيئة دون تعديل الكود
 const FRONTEND_URL = APP_URL || 'https://jovial-marigold-96501a.netlify.app/'; // رابط التطبيق (زر «اربح الان»)
 const CHANNEL_URL = process.env.CHANNEL_URL || 'https://t.me/moneyslayerchannel';  // رابط القناة
@@ -167,7 +171,7 @@ const fail = (code, status = 400, extra = {}) => { throw new AppError(code, stat
    المجموعات: users (_id = معرّف تيليجرام) · tasks · promos (_id = الكود) · settings · meta
    كل تعديل على الرصيد يتم بتحديث ذرّي واحد (pipeline update) مع شرط في الفلتر،
    فلا يمكن لطلبين متزامنين خصم نفس الرصيد مرتين أو استلام نفس المكافأة مرتين. */
-let users, tasksC, promos, settingsC, metaC, crashC, crashBets, treasureC, supportC;
+let users, tasksC, promos, settingsC, metaC, crashC, crashBets, treasureC, supportC, cpaC;
 
 async function seedTasks() {
   const first = await metaC.updateOne({ _id: 'seeded' }, { $setOnInsert: { at: Date.now() } }, { upsert: true });
@@ -182,7 +186,7 @@ async function connect() {
   const db = client.db(MONGODB_DB);
   users = db.collection('users'); tasksC = db.collection('tasks'); promos = db.collection('promos');
   settingsC = db.collection('settings'); metaC = db.collection('meta');
-  crashC = db.collection('crashRounds'); crashBets = db.collection('crashBets'); treasureC = db.collection('treasureGames'); supportC = db.collection('support');
+  crashC = db.collection('crashRounds'); crashBets = db.collection('crashBets'); treasureC = db.collection('treasureGames'); supportC = db.collection('support'); cpaC = db.collection('cpaConversions');
   await Promise.all([
     users.createIndex({ invitedBy: 1 }), users.createIndex({ totalEarned: -1 }), users.createIndex({ joinedAt: -1 }),
     users.createIndex({ 'withdrawals.id': 1 }), promos.createIndex({ createdAt: -1 }), users.createIndex({ lastSeen: -1 }), users.createIndex({ crashSeen: -1 }), users.createIndex({ balance: -1, joinedAt: 1 }),
@@ -314,10 +318,14 @@ async function profileOf(u) {
   };
 }
 const publicTask = (t, u) => {
-  const { verifyChat, verifyMembership, verifySeconds, _id, ord, ...pub } = t; // eslint-disable-line no-unused-vars
+  const { verifyChat, verifyMembership, verifySeconds, offerId, _id, ord, ...pub } = t; // eslint-disable-line no-unused-vars
   const st = (u.taskState || {})[t.id] || {};
-  return { ...pub, status: st.status || 'available', verifyAt: st.verifyAt || 0, opened: !!st.openedAt };
+  const out = { ...pub, url: taskUrl(t, u), status: st.status || 'available', verifyAt: st.verifyAt || 0, opened: !!st.openedAt };
+  if (t.check === 'cpa') out.verified = !!st.cpaVerified; // مهمة عروض AdBlueMedia: تُستلم فقط بعد وصول التحويل
+  return out;
 };
+/** رابط المهمة: يستبدل {uid} بمعرّف المستخدم (يُمرَّر لـ AdBlueMedia كـ aff_sub ليعود في الـ Postback) */
+const taskUrl = (t, u) => String(t.url || '').replace(/\{uid\}/g, String(u.id || ''));
 
 /* ───────────── التسجيل والإحالة (مشترك بين التطبيق والبوت) ─────────────
    الحساب يُنشأ مرة واحدة بـ upsert ذرّي (مع مكافأة الترحيب داخل المستند نفسه)، وعند الإنشاء الفعلي فقط
@@ -548,7 +556,34 @@ app.get('/telegram/setup', limiter('tgsetup', 10, 60000), wrap(async (req) => {
   return setupWebhook(PUBLIC_URL || `https://${host}`);
 }));
 
-/* ═══════════════ المستخدم ═══════════════ */
+/* ═══════════════ Postback من AdBlueMedia ═══════════════
+   في لوحة AdBlueMedia ← عنوان URL لإعادة الإرسال ضع (الرابط الجاهز يعرضه الأدمن عبر الإجراء postbackUrl):
+     https://<دومين-الخادم>/postback/adblue?key=<POSTBACK_KEY>&uid={aff_sub}&offer_id={offer_id}&offer_name={offer_name}&payout={payout}
+   ورابط مهمة العرض في لوحة الأدمن يجب أن يحمل {uid} في بارامتر التتبع (مثل &aff_sub={uid}) فيستبدله الخادم بمعرّف المستخدم.
+   عند وصول تحويل صحيح: يُسجَّل مرة واحدة لكل (مستخدم، عرض) وتُوسَم مهمة العرض «متحقَّق منها» فيستطيع المستخدم الاستلام.
+   خارج /api عمدًا (طلبات من خوادم AdBlueMedia، لا initData). */
+app.all('/postback/adblue', limiter('postback', 300, 60000), wrap(async (req, res) => {
+  const q = { ...req.query, ...(req.body || {}) };
+  if (!POSTBACK_KEY || !safeEq(String(q.key || ''), POSTBACK_KEY)) fail('unauthorized', 403);
+  const uid = Number(q.uid), offerId = String(q.offer_id || '').trim().slice(0, 40);
+  if (!Number.isSafeInteger(uid) || uid <= 0 || !offerId) fail('bad_value');
+  const u = await getUser(uid);
+  if (!u) { console.warn(`[postback] unknown user ${uid} offer ${offerId}`); return res.status(200).send('user_not_found'); }
+  // المهمة المرتبطة بالعرض: check=cpa و offerId يطابق رقم العرض
+  const t = await tasksC.findOne({ check: 'cpa', offerId, active: { $ne: false } });
+  const cid = `${uid}:${offerId}`;
+  try { await cpaC.insertOne({ _id: cid, uid, offerId, offerName: String(q.offer_name || '').slice(0, 120), payout: Number(q.payout) || 0, task: t ? t._id : '', at: Date.now() }); }
+  catch (e) { if (e.code === 11000) return res.status(200).send('duplicate'); throw e; }
+  if (!t) { console.warn(`[postback] no task for offer ${offerId}`); return res.status(200).send('no_task'); }
+  const p = `taskState.${t._id}`, now = Date.now();
+  await users.updateOne({ _id: uid, [`${p}.status`]: { $exists: false } }, { $set: { [`${p}.status`]: 'started', [`${p}.verifyAt`]: 0 } });
+  await users.updateOne({ _id: uid, [`${p}.status`]: 'started' }, { $set: { [`${p}.cpaVerified`]: now } });
+  console.log(`[postback] verified user ${uid} offer ${offerId} task ${t._id}`);
+  return res.status(200).send('ok');
+}));
+
+/* ═══════════════ المستخدم ═══════════════
+   (مسار postback AdBlueMedia أعلاه خارج /api) */
 const U = express.Router();
 U.use(auth);
 
@@ -578,7 +613,7 @@ U.post('/tasks/start', wrap(async (req) => {
     const r = await users.updateOne({ _id: u.id, [`taskState.${id}`]: { $exists: false } }, { $set: { [`taskState.${id}`]: st } });
     if (!r.modifiedCount) { st = ((await getUser(u.id)).taskState || {})[id] || st; if (st.status === 'done') fail('task_done', 409); }
   }
-  return { task: publicTask(t, { taskState: { [id]: st } }), url: t.url };
+  return { task: publicTask(t, { id: u.id, taskState: { [id]: st } }), url: taskUrl(t, u) };
 }));
 
 // POST /api/tasks/opened {id} — مهمة القصة: يسجّل الخادم لحظة فتح المستخدم محرر القصص، ومنها يبدأ عدّاد الانتظار (verifySeconds، الافتراضي 60 ثانية).
@@ -664,6 +699,13 @@ U.post('/tasks/claim', wrap(async (req) => {
   const p = `taskState.${id}`, st = (u.taskState || {})[id];
   if (st?.status === 'done') fail('task_done', 409);
   if (!st) fail('task_pending', 409);
+  if (t.check === 'cpa') { // عروض AdBlueMedia: لا مكافأة إلا بعد أن يؤكد AdBlueMedia التحويل عبر Postback
+    if (!st.cpaVerified) fail('cpa_pending', 409, { wait: 10, message: 'لم يصل تأكيد إتمام العرض بعد. أكمل العرض كاملًا ثم اضغط استلام (قد يستغرق التأكيد بضع دقائق)' });
+    const nu = await credit({ _id: u.id, [`${p}.status`]: 'started', [`${p}.cpaVerified`]: { $gt: 0 } }, 'task', t.reward, { ref: t.title },
+      { set: { [p]: { status: 'done', verifyAt: st.verifyAt || 0, cpaVerified: st.cpaVerified } }, inc: { completed: 1, [`taskDays.${dayKey()}`]: 1 } });
+    if (!nu) fail('task_done', 409);
+    return { profile: await profileOf(nu), reward: t.reward, task: publicTask(t, nu) };
+  }
   if (t.check === 'story' && !st.openedAt) fail('story_not_opened', 409, { message: 'افتح محرر القصة أولًا' });
   if (Date.now() < st.verifyAt) fail('task_pending', 409, { wait: Math.ceil((st.verifyAt - Date.now()) / 1000) });
   const kind = CHECKS.includes(t.check) ? t.check : '';
@@ -804,6 +846,48 @@ U.post('/ads/claim', wrap(async (req) => {
   );
   if (!nu) fail('ads_pending', 409);
   return { profile: await profileOf(nu), reward: a.reward };
+}));
+
+// ═══════════════ مسابقة السفر والعمل في هولندا ═══════════════
+// الشروط: مشاهدة 5000 إعلان + دعوة 210 صديق + إكمال 50 مهمة (لا تشمل الإعلانات) منذ انطلاق المنصة.
+// النقاط = إعلانات + دعوات + مهام. لوحة الصدارة تضم فقط من اعتُمدت مشاركتهم (verify)، ورتبتي تُحسب دائمًا
+// بين المعتمدين (1 + عدد من نقاطهم أكبر من نقاطي) فتظهر لكل مستخدم حتى لو لم يحقق الشروط بعد.
+const CONTEST = { ads: 5000, invites: 210, tasks: 50, top: 10, maxBoard: 5000 };
+const adsTotalOf = (u) => Object.values(u.adDays || {}).reduce((a, n) => a + (Number(n) || 0), 0); // adDays: عدّاد يومي لكل مستخدم ولا يُحذف
+
+const contestCounts = async (u) => ({ ads: adsTotalOf(u), invites: await users.countDocuments({ invitedBy: u.id }), tasks: u.completed || 0 });
+const contestMet = (h) => h.ads >= CONTEST.ads && h.invites >= CONTEST.invites && h.tasks >= CONTEST.tasks;
+
+async function contestOf(u) {
+  const mine = await contestCounts(u);
+  const rows = await users.find({ 'contest.verifiedAt': { $gt: 0 }, banned: { $ne: true } }).limit(CONTEST.maxBoard)
+    .project({ id: 1, first_name: 1, last_name: 1, adDays: 1, completed: 1 }).toArray();
+  const ids = rows.map((x) => x.id);
+  const inv = ids.length ? await users.aggregate([{ $match: { invitedBy: { $in: ids } } }, { $group: { _id: '$invitedBy', n: { $sum: 1 } } }]).toArray() : [];
+  const invMap = new Map(inv.map((x) => [x._id, x.n]));
+  // الخصوصية: اسم مختصر فقط، دون معرّف أو يوزر أو صورة
+  const list = rows.map((x) => {
+    const r = { ads: adsTotalOf(x), invites: invMap.get(x.id) || 0, tasks: x.completed || 0 };
+    return { name: `${x.first_name || ''}${x.last_name ? ` ${x.last_name[0]}.` : ''}`.trim() || '—', ...r, points: r.ads + r.invites + r.tasks, isMe: x.id === u.id };
+  }).sort((a, b) => b.points - a.points);
+  const points = mine.ads + mine.invites + mine.tasks;
+  return {
+    ...mine, points, need: { ads: CONTEST.ads, invites: CONTEST.invites, tasks: CONTEST.tasks },
+    verified: !!u.contest?.verifiedAt,
+    rank: 1 + list.filter((x) => !x.isMe && x.points > points).length,
+    leaderboard: list.slice(0, CONTEST.top).map(({ name, ads, invites, tasks, isMe }) => ({ name, ads, invites, tasks, isMe })),
+  };
+}
+
+// GET /api/contest
+U.get('/contest', limiter('contest', 30, 60000, (r) => r.u.id), wrap(async (req) => ({ contest: await contestOf((await getUser(req.u.id)) || req.u) })));
+
+// POST /api/contest/verify — التحقق على الخادم فقط (لا يُعتمد على أرقام العميل)
+U.post('/contest/verify', limiter('contestv', 10, 60000, (r) => r.u.id), wrap(async (req) => {
+  const u = (await getUser(req.u.id)) || req.u;
+  if (!contestMet(await contestCounts(u))) fail('contest_not_met', 409);
+  await users.updateOne({ _id: u.id, 'contest.verifiedAt': { $exists: false } }, { $set: { 'contest.verifiedAt': Date.now() } });
+  return { verified: true, contest: await contestOf(await getUser(u.id)) };
 }));
 
 // POST /api/withdraw — خصم ذرّي: التحقق من الرصيد والخصم في تحديث واحد
@@ -1282,6 +1366,12 @@ const ADMIN = {
     if (!/^https:\/\//i.test(base)) fail('bad_value');
     return setupWebhook(base);
   },
+  // رابط Postback الجاهز للصقه في AdBlueMedia (يعرض المفتاح — للأدمن فقط)
+  postbackUrl: async (b) => {
+    const base = String(b.baseUrl || PUBLIC_URL || '').replace(/\/+$/, '');
+    if (!/^https:\/\//i.test(base)) fail('bad_value');
+    return { url: `${base}/postback/adblue?key=${POSTBACK_KEY}&uid={aff_sub}&offer_id={offer_id}&offer_name={offer_name}&payout={payout}` };
+  },
   settings: async () => ({ settings: await RAW() }),
   saveSettings: async (b) => {
     if (!b.settings || typeof b.settings !== 'object') fail('bad_value');
@@ -1302,7 +1392,10 @@ const ADMIN = {
     t.id = String(t.id); if (!ID_RE.test(t.id)) fail('bad_value');
     delete t._id; delete t.ord; delete t.status; delete t.verifyAt;
     // نوع التحقق الاختياري للمهمة: bio | name | story (فارغ = المهمة العادية)
-    t.check = CHECKS.includes(t.check) ? t.check : '';
+    t.check = CHECKS.includes(t.check) || t.check === 'cpa' ? t.check : '';
+    t.offerId = String(t.offerId || '').trim().replace(/[^0-9A-Za-z_-]/g, '').slice(0, 40); // رقم العرض في AdBlueMedia (يطابق {offer_id} في الـ Postback)
+    if (t.check === 'cpa' && !t.offerId) fail('bad_value');
+    if (t.check === 'cpa' && !/^https:\/\//i.test(String(t.url || ''))) fail('bad_value');
     t.verifySeconds = Math.min(3600, Math.max(0, Math.round(Number(t.verifySeconds) || 0))); // 0 = الافتراضي (10 ث للعادية، 60 ث للقصة)
     t.checkText = String(t.checkText || '').trim().slice(0, 60);
     t.storyImage = String(t.storyImage || '').trim().slice(0, 500);
@@ -1342,7 +1435,7 @@ const ADMIN = {
   // إعادة ضبط كل البيانات (تجريبي — معطّل افتراضيًا لأنه يمسح قاعدة البيانات بالكامل)
   reset: async () => {
     if (!DEMO_TOOLS) fail('not_found', 404);
-    await Promise.all([users, tasksC, promos, settingsC, metaC, crashC, crashBets, supportC].map((c) => c.deleteMany({})));
+    await Promise.all([users, tasksC, promos, settingsC, metaC, crashC, crashBets, supportC, cpaC].map((c) => c.deleteMany({})));
     cfgCache = { at: 0, v: null };
     await seedTasks();
     return { ok: true };
@@ -1366,7 +1459,7 @@ app.post('/api/admin/:action', limiter('admin', 60, 60000), (req, res, next) => 
 app.use('/api', U);
 
 /* ───────────── 404 + معالج الأخطاء (HTTP مناسب + {code,message}) ───────────── */
-const MSG = { not_joined: 'لم يتم التحقق من تنفيذ المهمة', ads_pending: 'لم تكتمل مدة الإعلان بعد', ads_wait: 'انتظر قبل الإعلان التالي', not_telegram: 'افتح التطبيق من داخل تيليجرام', bad_session: 'جلسة غير صالحة', expired: 'انتهت الجلسة', banned: 'الحساب محظور', not_found: 'غير موجود', rate_limited: 'طلبات كثيرة، حاول لاحقًا' };
+const MSG = { cpa_pending: 'لم يصل تأكيد إتمام العرض بعد', not_joined: 'لم يتم التحقق من تنفيذ المهمة', ads_pending: 'لم تكتمل مدة الإعلان بعد', ads_wait: 'انتظر قبل الإعلان التالي', not_telegram: 'افتح التطبيق من داخل تيليجرام', bad_session: 'جلسة غير صالحة', expired: 'انتهت الجلسة', banned: 'الحساب محظور', not_found: 'غير موجود', contest_not_met: 'لم تكتمل شروط المسابقة بعد', rate_limited: 'طلبات كثيرة، حاول لاحقًا' };
 app.use((req, res) => res.status(404).json({ success: false, code: 'not_found', message: 'المسار غير موجود' }));
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
   if (err instanceof AppError) return res.status(err.status).json({ success: false, code: err.code, message: MSG[err.code] || err.code, ...err.extra });
