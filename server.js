@@ -100,8 +100,10 @@ const APP_URL = process.env.APP_URL || '';
 const ADMIN_TG_ID = process.env.ADMIN_TG_ID || '';
 // مفتاح Postback الخاص بـ AdBlueMedia (يُشتق من BOT_TOKEN إن لم يُضبط). يُوضع في رابط إعادة الإرسال ?key=... ويستعرضه الأدمن عبر الإجراء postbackUrl
 const POSTBACK_KEY = process.env.POSTBACK_KEY || derive('postback').slice(0, 32);
+// تأكيد الإعلان من Monetag عبر Postback: عند ضبط ADS_CONFIRM=1 لا تُصرف مكافأة الإعلان إلا إذا وصل الخادمَ حدث حقيقي (impression/click) لجلسة المستخدم الحالية
+const ADS_CONFIRM = process.env.ADS_CONFIRM === '1';
 // روابط رسالة الترحيب (/start) — يمكن تغييرها من متغيرات البيئة دون تعديل الكود
-const FRONTEND_URL = APP_URL || 'https://comfy-begonia-50dc4a.netlify.app/'; // رابط التطبيق (زر «اربح الان»)
+const FRONTEND_URL = APP_URL || 'https://jovial-marigold-96501a.netlify.app/'; // رابط التطبيق (زر «اربح الان»)
 const CHANNEL_URL = process.env.CHANNEL_URL || 'https://t.me/moneyslayerchannel';  // رابط القناة
 const GROUP_URL = process.env.GROUP_URL || 'https://t.me/moneyslayergroup';        // رابط المجموعة
 const INIT_MAX_AGE = 24 * 3600; // ثانية — عمر initData المسموح
@@ -582,6 +584,25 @@ app.all('/postback/adblue', limiter('postback', 300, 60000), wrap(async (req, re
   return res.status(200).send('ok');
 }));
 
+/* ═══════════════ Postback من Monetag (تأكيد مشاهدة الإعلان) ═══════════════
+   في لوحة Monetag ← Postbacks ضع (الرابط الجاهز يعرضه الأدمن عبر الإجراء monetagPostbackUrl):
+     https://<دومين-الخادم>/postback/monetag?key=<POSTBACK_KEY>&ymid={ymid}&telegram_id={telegram_id}&event_type={event_type}&reward_event_type={reward_event_type}&zone_id={zone_id}
+   المستخدم يُعرَّف بـ ymid أو telegram_id (أرقام معرّف تيليجرام). يُربط الحدث بجلسة الإعلان الحالية فقط (adSession) فلا يمكن استخدامه لإعلان آخر.
+   عند ADS_CONFIRM=1 يرفض /api/ads/claim أي استلام بلا هذا الحدث. خارج /api عمدًا (طلبات من خوادم Monetag). */
+app.all('/postback/monetag', limiter('postback', 600, 60000), wrap(async (req, res) => {
+  const q = { ...req.query, ...(req.body || {}) };
+  if (!POSTBACK_KEY || !safeEq(String(q.key || ''), POSTBACK_KEY)) fail('unauthorized', 403);
+  const m = [q.ymid, q.telegram_id, q.uid].map((v) => /^\d{1,15}/.exec(String(v || '').trim())).find(Boolean);
+  const uid = m ? Number(m[0]) : 0;
+  if (!Number.isSafeInteger(uid) || uid <= 0) return res.status(200).send('no_user');
+  const ev = String(q.event_type || '').toLowerCase();
+  if (ev && ev !== 'impression' && ev !== 'click') return res.status(200).send('ignored');
+  if (String(q.reward_event_type || '').toLowerCase() === 'not_valued') return res.status(200).send('not_valued');
+  // يثبّت الحدث على جلسة الإعلان الجارية فقط (ذرّي): adEvent = adSession
+  const r = await users.updateOne({ _id: uid, adSession: { $gt: 0 } }, [{ $set: { adEvent: '$adSession', adEventAt: Date.now() } }]);
+  return res.status(200).send(r.modifiedCount ? 'ok' : 'no_session');
+}));
+
 /* ═══════════════ المستخدم ═══════════════
    (مسار postback AdBlueMedia أعلاه خارج /api) */
 const U = express.Router();
@@ -833,6 +854,11 @@ U.post('/ads/claim', wrap(async (req) => {
   if (done >= a.dailyLimit) fail('ads_limit', 409);
   const left = Math.ceil((u.adSession + a.duration * 1000 - now) / 1000); // مدة المشاهدة الكاملة من إعدادات الأدمن
   if (left > 0) fail('ads_pending', 409, { wait: left });
+  if (ADS_CONFIRM && u.adEvent !== u.adSession) { // لم يصل تأكيد Monetag لهذه الجلسة
+    if (now - u.adSession < (a.duration + 45) * 1000) fail('ads_pending', 409, { wait: 3 }); // قد يتأخر الـpostback قليلًا
+    await users.updateOne({ _id: u.id, adSession: u.adSession }, { $set: { adSession: 0 } }); // الجلسة بلا تأكيد: تُلغى ويُطلب إعلان جديد
+    fail('ads_unverified', 409);
+  }
   if (now - u.adSession > 30 * 60000) { // جلسة قديمة جدًا: تُلغى ويُطلب إعلان جديد
     await users.updateOne({ _id: u.id, adSession: u.adSession }, { $set: { adSession: 0 } });
     fail('ads_pending', 409);
@@ -1371,6 +1397,12 @@ const ADMIN = {
     const base = String(b.baseUrl || PUBLIC_URL || '').replace(/\/+$/, '');
     if (!/^https:\/\//i.test(base)) fail('bad_value');
     return { url: `${base}/postback/adblue?key=${POSTBACK_KEY}&uid={aff_sub}&offer_id={offer_id}&offer_name={offer_name}&payout={payout}` };
+  },
+  // رابط Postback الجاهز للصقه في Monetag (يعرض المفتاح — للأدمن فقط)
+  monetagPostbackUrl: async (b) => {
+    const base = String(b.baseUrl || PUBLIC_URL || '').replace(/\/+$/, '');
+    if (!/^https:\/\//i.test(base)) fail('bad_value');
+    return { url: `${base}/postback/monetag?key=${POSTBACK_KEY}&ymid={ymid}&telegram_id={telegram_id}&event_type={event_type}&reward_event_type={reward_event_type}&zone_id={zone_id}`, enabled: ADS_CONFIRM };
   },
   settings: async () => ({ settings: await RAW() }),
   saveSettings: async (b) => {
